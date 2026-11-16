@@ -1640,6 +1640,9 @@ class Envs:
     # reductions up to the byte limit (decode/verify sizes); larger ones use RCCL.
     SGLANG_GFX1201_PCIE_CUSTOM_AR = EnvBool(False)
     SGLANG_GFX1201_PCIE_CUSTOM_AR_MAX_BYTES = EnvInt(512 * 1024)
+    # gfx1201 MXFP4 prefill rows (1024-2048) on the P1 FP8 route: lossless FP8
+    # weight expansion, FP8/G128 activations (P1-NUMERICAL-CONTRACT-v1).
+    SGLANG_GFX1201_P1_PREFILL = EnvBool(False)
     SGLANG_PCIE_IPC_MAX_NUMEL = EnvInt(0)
 
     # ===================================================================

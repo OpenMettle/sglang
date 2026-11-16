@@ -174,6 +174,14 @@ def _is_gfx1201() -> bool:
 # (ASM GEMM, pre-quantized and fused split-cat inputs) are unavailable there.
 _use_gfx1201_mxfp4 = _is_hip and importlib.util.find_spec("aiter") is None and _is_gfx1201()
 
+# gfx1201 P1 prefill route (opt-in): admitted prefill rows run an FP8 GEMM on a
+# lossless FP8 expansion of the MXFP4 weight. One route per serving process.
+_gfx1201_p1 = None
+if _use_gfx1201_mxfp4 and envs.SGLANG_GFX1201_P1_PREFILL.get():
+    from sglang.srt.layers.quantization.quark.schemes import gfx1201_p1_prefill
+
+    _gfx1201_p1 = gfx1201_p1_prefill.install(torch, gfx1201_p1_prefill.SETTING)
+
 if _use_gfx1201_mxfp4:
     from sglang.srt.layers.quantization.quark.schemes.gfx1201_mxfp4 import (
         dynamic_mxfp4_quant,
@@ -450,6 +458,11 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
             return
 
         layer.use_aiter_asm_fp4_gemm = False
+        if _gfx1201_p1 is not None:
+            n, k = layer.weight.shape[0], layer.weight.shape[1] * 2
+            if _gfx1201_p1.admits_shape(n, k):
+                # Expand once, require zero guard flags, compile before traffic.
+                _gfx1201_p1.validate_layer(layer, n, k)
         if not _use_aiter_asm_fp4_gemm or not is_gfx95_supported():
             return
 
@@ -956,6 +969,21 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
             three_d = True
             x = x.view(-1, x.shape[-1])
             output_shape = [*x.shape[:-1], layer.weight.shape[0]]
+
+        if (
+            _gfx1201_p1 is not None
+            and x_s is None
+            and y is None
+            and not fused_gemm_split_cat
+            and bias is None
+            and x.dtype == torch.bfloat16
+            and x.is_contiguous()
+            and _gfx1201_p1.admits(x.shape[0], layer.weight.shape[0], x.shape[1])
+            and _gfx1201_p1.is_validated(layer)
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            y = _gfx1201_p1.apply(layer, x, layer.weight.shape[0], x.shape[1])
+            return y.view(*output_shape) if three_d else y
 
         # use_fused_quant_gemm = true, x_q is a bf16/fp16 num
         # x_s is not None = true, x_q is uint8 num

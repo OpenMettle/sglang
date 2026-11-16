@@ -829,6 +829,15 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         qkvz.weight.data, ba.weight.data = weight[:rows], weight[rows:]
         qkvz.weight_scale.data, ba.weight_scale.data = scale[:rows], scale[rows:]
         self._gfx1201_in_proj = (weight, scale, rows)
+        # The P1 prefill route pins each validated layer's weight storage; the
+        # bytes are unchanged, so expand and check the moved shards again.
+        p1 = quark_w4a4_mxfp4._gfx1201_p1
+        if p1 is not None:
+            for proj in (qkvz, ba):
+                if p1.is_validated(proj):
+                    p1.validate_layer(
+                        proj, proj.weight.shape[0], proj.weight.shape[1] * 2, rebind=True
+                    )
         return True
 
     def _finalize_fused_fp8_in_proj(self) -> bool:
