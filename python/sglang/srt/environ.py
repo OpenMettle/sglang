@@ -1654,6 +1654,9 @@ class Envs:
     # gfx1201: SiLU(gate) * up + MXFP4 quantization in one kernel for an MXFP4
     # down projection on verify-sized batches.
     SGLANG_GFX1201_SILU_MUL_MXFP4 = EnvBool(False)
+    # gfx1201: target-verify attention (SGLANG_GFX1201_VERIFY_ATTENTION) with a
+    # wider tile (BT 64, 8 warps, QC 64) when a batch has one request.
+    SGLANG_GFX1201_VERIFY_ATTENTION_B1_TILE = EnvBool(False)
     SGLANG_PCIE_IPC_MAX_NUMEL = EnvInt(0)
 
     # ===================================================================
