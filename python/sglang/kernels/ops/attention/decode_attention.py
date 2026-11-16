@@ -29,6 +29,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.arch import current_arch
+from sglang.kernels.ops.attention import gfx1201_fp8_kv
 from sglang.kernels.ops.attention.score_mod import unpack_aux_tensors
 from sglang.srt.environ import envs
 from sglang.srt.utils import (
@@ -557,6 +558,8 @@ def _fwd_grouped_kernel_stage1(
     HAS_MLA: tl.constexpr = False,
     USE_PDL: tl.constexpr = False,
     IS_GFX1250: tl.constexpr = False,
+    # gfx1201_fp8_kv: keep q and p in bf16 and cast the fp8 K/V tiles up for both dots
+    KV_DEQUANT: tl.constexpr = False,
     PAGE_SIZE: tl.constexpr = 1,
     SCORE_MOD: tl.constexpr = None,
     Aux0=None,
@@ -646,7 +649,7 @@ def _fwd_grouped_kernel_stage1(
         # bf16 cache. (Do NOT "optimize" this back to q.to(fp8) on gfx1250.)
         # On all other platforms keep the original downcast of q to the KV dtype.
         # TODO: remove this branch once the gfx1250 fp8 tl.dot issue is resolved.
-        if IS_GFX1250:
+        if IS_GFX1250 or KV_DEQUANT:
             q_k = q
         else:
             q_k = q.to(K_Buffer.dtype.element_ty)
@@ -677,7 +680,7 @@ def _fwd_grouped_kernel_stage1(
                 mask=(offs_n[None, :] < split_kv_end) & (mask_d[:, None]),
                 other=0.0,
             )
-            if IS_GFX1250:
+            if IS_GFX1250 or KV_DEQUANT:
                 qk = tl.dot(q_k, k.to(q_k.dtype))
             else:
                 qk = tl.dot(q_k, k)
@@ -749,6 +752,8 @@ def _fwd_grouped_kernel_stage1(
             # TODO: remove this branch once the gfx1250 bf16 P·V issue is resolved.
             if IS_GFX1250:
                 acc += tl.dot(p, v.to(tl.float32), out_dtype=tl.float32)
+            elif KV_DEQUANT:
+                acc += tl.dot(p.to(q.dtype), v.to(q.dtype))
             else:
                 acc += tl.dot(p.to(v.dtype), v)
 
@@ -908,6 +913,7 @@ def _decode_grouped_att_m_fwd(
         HAS_MLA=has_mla,
         USE_PDL=use_pdl,
         IS_GFX1250=_is_gfx1250,
+        KV_DEQUANT=gfx1201_fp8_kv.applies(k_buffer, v_buffer),
         PAGE_SIZE=page_size,
         SCORE_MOD=score_mod,
         Aux0=aux0,
@@ -1231,6 +1237,8 @@ def decode_attention_fwd(
             enable_lean, logit_cap, sinks, xai_temperature_len, score_mod
         )
         and lean_locks is not None
+        # Lean runs fp8 x fp8 dots; gfx1201_fp8_kv keeps fp8 caches on the grouped kernel
+        and not gfx1201_fp8_kv.applies(k_buffer, v_buffer)
     ):
         total_programs, XCD_REMAP, NUM_XCDS = _lean_decode_launch_params(
             v_buffer.shape[-2], kv_group_num

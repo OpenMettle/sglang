@@ -25,6 +25,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.arch import current_arch
+from sglang.kernels.ops.attention import gfx1201_fp8_kv
 from sglang.kernels.ops.attention.decode_attention import _extract_kv_strides
 from sglang.kernels.ops.attention.score_mod import unpack_aux_tensors
 from sglang.srt.environ import envs
@@ -457,6 +458,8 @@ def _fwd_kernel(
     USE_FP8_EXTEND: tl.constexpr,
     FP8_MAX: tl.constexpr,
     IS_GFX1250: tl.constexpr = False,
+    # gfx1201_fp8_kv: cast the fp8 prefix K/V tiles to q's dtype (bf16) for both dots
+    KV_DEQUANT: tl.constexpr = False,
     PAGE_SIZE: tl.constexpr = 1,
     IDENTITY_KV_INDICES: tl.constexpr = False,
     SCORE_MOD: tl.constexpr = None,
@@ -637,7 +640,7 @@ def _fwd_kernel(
             # downcasting q to fp8. No-op for a bf16 cache. (Do NOT revert to q.to(fp8).)
             # On all other platforms keep the original q.to(k.dtype) downcast.
             # TODO: remove this branch once the gfx1250 fp8 tl.dot issue is resolved.
-            if IS_GFX1250:
+            if IS_GFX1250 or KV_DEQUANT:
                 qk = tl.dot(q, k.to(q.dtype))
             else:
                 qk = tl.dot(q.to(k.dtype), k)
@@ -732,6 +735,8 @@ def _fwd_kernel(
                 # TODO: remove this branch once the gfx1250 bf16 P·V issue is resolved.
                 if IS_GFX1250:
                     dot = tl.dot(p, v.to(tl.float32), out_dtype=tl.float32)
+                elif KV_DEQUANT:
+                    dot = tl.dot(p.to(q.dtype), v.to(q.dtype))
                 else:
                     dot = tl.dot(p.to(v.dtype), v)
                 acc = acc * re_scale[:, None] + dot * v_scale
@@ -1194,6 +1199,7 @@ def extend_attention_fwd(
         SKIP_EXTEND=skip_extend,
         HAS_SINK=HAS_SINK,
         IS_GFX1250=_is_gfx1250,
+        KV_DEQUANT=gfx1201_fp8_kv.applies(k_buffer, v_buffer),
         STORE_TRANSPOSE=_is_hip,
         USE_COMPACT_TILE_GRID=use_compact_tile_grid,
         USE_EXP2=USE_EXP2,

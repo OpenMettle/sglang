@@ -22,6 +22,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.attention import gfx1201_fp8_kv
 from sglang.srt.utils import get_bool_env_var, is_hip, use_gfx115_kernels
 
 logger = logging.getLogger(__name__)
@@ -127,12 +128,14 @@ def _verify_split_kernel(
         sc = tl.zeros((R, BT), tl.float32)
         for c in tl.static_range(0, D, QC):
             qc = tl.load(q_rows + c + dq[None, :], volatile=True)
+            # bf16 operands for both dots; a no-op for a bf16 cache, the dequant of an
+            # fp8 one (gfx1201_fp8_kv; the caller folds k_scale into scale)
             kc = tl.load(
                 tl.max_contiguous(
                     tl.multiple_of(k_ptr + base[:, None] + c + dq[None, :], [1, 16]),
                     [1, 8],
                 )
-            )
+            ).to(tl.bfloat16)
             sc = tl.dot(qc, tl.trans(kc), sc)
         sc = sc * scale
         off = base[:, None] + d[None, :]
@@ -144,7 +147,9 @@ def _verify_split_kernel(
         p = tl.exp(sc - m_safe[:, None])
         alpha = tl.exp(m_i - m_safe)
         l_i = l_i * alpha + tl.sum(p, axis=1)
-        v = tl.load(tl.max_contiguous(tl.multiple_of(v_ptr + off, [1, 16]), [1, 8]))
+        v = tl.load(tl.max_contiguous(tl.multiple_of(v_ptr + off, [1, 16]), [1, 8])).to(
+            tl.bfloat16
+        )
         acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), v)
         m_i = m_new
     # partial row of (request token row, q head, split)
@@ -156,9 +161,10 @@ def _verify_split_kernel(
 
 @triton.jit
 def _verify_combine_kernel(
-    part_ptr, ml_ptr, o_ptr, D: tl.constexpr, NSPLIT: tl.constexpr
+    part_ptr, ml_ptr, o_ptr, v_scale, D: tl.constexpr, NSPLIT: tl.constexpr
 ):
-    """Merge one (token row, q head)'s splits into ``o`` (bf16)."""
+    """Merge one (token row, q head)'s splits into ``o`` (bf16); ``v_scale`` dequantises
+    the fp8 V contribution (1.0 for a bf16 cache)."""
     row = tl.program_id(0)
     d = tl.arange(0, D)
     mx = tl.full((8,), float("-inf"), tl.float32)
@@ -187,14 +193,16 @@ def _verify_combine_kernel(
         num += tl.sum(w[:, None] * acc, axis=0)
         den += w * ll
     tl.store(
-        o_ptr + row * D + d, (num / tl.sum(den, axis=0)).to(o_ptr.dtype.element_ty)
+        o_ptr + row * D + d,
+        (num / tl.sum(den, axis=0) * v_scale).to(o_ptr.dtype.element_ty),
     )
 
 
 def covered(q, o, k_buffer, v_buffer, num_tokens_per_req, hq, hkv, d) -> bool:
-    """Whether ``verify_attention_gfx1151`` takes this layer: gfx115x, bf16, at most 8 draft
-    tokens per request and 8 q heads per kv head, dense ``[B * T, H, D]`` q and o (the
-    kernel addresses them without strides), int32-addressable contiguous caches."""
+    """Whether ``verify_attention_gfx1151`` takes this layer: gfx115x, bf16 (or an fp8
+    cache under gfx1201_fp8_kv), at most 8 draft tokens per request and 8 q heads per kv
+    head, dense ``[B * T, H, D]`` q and o (the kernel addresses them without strides),
+    int32-addressable contiguous caches."""
     return (
         enabled()
         and 0 < num_tokens_per_req <= 8
@@ -204,7 +212,10 @@ def covered(q, o, k_buffer, v_buffer, num_tokens_per_req, hq, hkv, d) -> bool:
         and q.dtype == torch.bfloat16
         and q.is_contiguous()
         and o.is_contiguous()
-        and k_buffer.dtype == v_buffer.dtype == torch.bfloat16
+        and (
+            k_buffer.dtype == v_buffer.dtype == torch.bfloat16
+            or gfx1201_fp8_kv.applies(k_buffer, v_buffer)
+        )
         and k_buffer.is_contiguous()
         and v_buffer.is_contiguous()
         and k_buffer.shape == v_buffer.shape
@@ -224,13 +235,15 @@ def verify_attention_gfx1151(
     scale,
     nsplit=None,
     bt=None,
+    v_scale=1.0,
     num_warps=None,
     hg=6,
     qc=None,
 ):
     """``o[b * T + t, h]`` = attention of ``q[b * T + t, h]`` over ``seq_lens[b] + t + 1``
     tokens of request ``b`` (``req_to_token[req_pool_indices[b]]``); ``q`` and ``o`` are
-    ``[B * T, HQ, D]``, the caches ``[slots, HKV, D]``. Graph-capturable."""
+    ``[B * T, HQ, D]``, the caches ``[slots, HKV, D]``. For an fp8 cache ``scale``
+    includes ``k_scale`` and ``v_scale`` dequantises V. Graph-capturable."""
     rows, hq, d = q.shape
     hkv = k_buffer.shape[1]
     T = num_tokens_per_req
@@ -274,5 +287,7 @@ def verify_attention_gfx1151(
         # the default software pipelining doubles the LDS and adds spills
         num_stages=1,
     )
-    _verify_combine_kernel[(rows * hq,)](part, ml, o, D=d, NSPLIT=nsplit, num_warps=4)
+    _verify_combine_kernel[(rows * hq,)](
+        part, ml, o, float(v_scale), D=d, NSPLIT=nsplit, num_warps=4
+    )
     return o

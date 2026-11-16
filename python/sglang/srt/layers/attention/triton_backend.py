@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 import triton
 
+from sglang.kernels.ops.attention import gfx1201_fp8_kv
 from sglang.kernels.ops.attention.metadata import get_num_kv_splits_triton
 from sglang.kernels.ops.attention.mla_kv_pack_quantize_fp8 import (
     mla_kv_pack_quantize_fp8,
@@ -1685,10 +1686,12 @@ class TritonAttnBackend(AttentionBackend):
                 layer, loc, k, v, k_scale, v_scale, **kwargs
             )
 
-    def _gfx115_verify_attention(self, q, o, layer, forward_batch) -> bool:
+    def _gfx115_verify_attention(
+        self, q, o, layer, forward_batch, k_descale=1.0, v_descale=1.0
+    ) -> bool:
         """Target-verify attention on gfx115x that reads the cached prefix once for the
         whole draft block (the block's K/V are already in the cache). Returns whether it
-        ran."""
+        ran. The descales are 1.0 except for an fp8 cache under gfx1201_fp8_kv."""
         from sglang.kernels.ops.attention import verify_attention_gfx1151 as va
 
         # the token count qo_indptr is built from
@@ -1723,7 +1726,8 @@ class TritonAttnBackend(AttentionBackend):
             forward_batch.req_pool_indices,
             forward_batch.seq_lens,
             num_tokens_per_req,
-            layer.scaling,
+            layer.scaling * k_descale,
+            v_scale=v_descale,
         )
         return True
 
@@ -1916,9 +1920,12 @@ class TritonAttnBackend(AttentionBackend):
             and score_mod is None
             and sinks is None
             and sliding_window_size == -1
-            # bf16 KV checkpoints may still load unit k/v scales
-            and k_descale == 1.0
-            and v_descale == 1.0
+            # bf16 KV checkpoints may still load unit k/v scales; an fp8 cache read
+            # through gfx1201_fp8_kv applies its scales in the kernel
+            and (
+                (k_descale == 1.0 and v_descale == 1.0)
+                or gfx1201_fp8_kv.applies(*self.kv_layers.read(layer.layer_id).kv())
+            )
             and not logits_soft_cap
             and self.forward_metadata.custom_mask is None
             and not (
@@ -1926,7 +1933,9 @@ class TritonAttnBackend(AttentionBackend):
                 and self.kv_layers.route(layer.layer_id).sub_pool
                 == IdSpaceKind.SLIDING_WINDOW
             )
-            and self._gfx115_verify_attention(q, o, layer, forward_batch)
+            and self._gfx115_verify_attention(
+                q, o, layer, forward_batch, k_descale, v_descale
+            )
         ):
             return o
 
