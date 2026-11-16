@@ -18,6 +18,7 @@ from sglang.srt.configs.draft_parallel import DraftParallelSpec, DraftTPExecutio
 from sglang.srt.configs.laguna import normalize_gating
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
 from sglang.srt.hf_transformers import get_rope_config
+from sglang.srt.layers import gfx1201_fp8_lm_head
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layer_boundary import AttentionInputs, get_attn_tp_context
 from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
@@ -103,6 +104,13 @@ def _project_candidate_logits(
     if not use_quant_head:
         weight = lm_head.weight
         hidden = hidden.to(weight.dtype)
+        if gfx1201_fp8_lm_head.ENABLED:
+            # gfx1201: the target head's block FP8 copy on draft rows.
+            logits = gfx1201_fp8_lm_head.project(
+                hidden, lm_head, weight.dtype, num_rows=num_org
+            )
+            if logits is not None:
+                return logits
         # Tuned bf16 dispatch (kernel chosen by GEMM shape); bf16 CUDA only.
         backend = get_bf16_gemm_backend()
         if (

@@ -37,7 +37,7 @@ from sglang.kernels.ops.sampling.softcap_row_argmax import softcap_row_argmax
 from sglang.srt.beam_search.logits_capture import BeamLogitsCapture
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
 from sglang.srt.environ import envs
-from sglang.srt.layers import layernorm_sp
+from sglang.srt.layers import gfx1201_fp8_lm_head, layernorm_sp
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStates, pack_aux_hidden_states
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -1373,6 +1373,19 @@ class LogitsProcessor(nn.Module):
         *,
         out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if gfx1201_fp8_lm_head.ENABLED and embedding_bias is None:
+            # gfx1201: the head's block FP8 copy on DFLASH verify rows.
+            logits = gfx1201_fp8_lm_head.project(
+                hidden_states,
+                lm_head,
+                (
+                    torch.float32
+                    if self.use_fp32_lm_head or self.use_fp32_lm_head_output
+                    else hidden_states.dtype
+                ),
+            )
+            if logits is not None:
+                return logits
         quant_method = getattr(lm_head, "quant_method", None)
         if hasattr(lm_head, "set_lora") and hasattr(lm_head, "apply_lora"):
             # This is a LoRA-wrapped module, use its forward method

@@ -1952,6 +1952,9 @@ class Qwen3_5ForCausalLM(nn.Module):
         return self.embed_tokens
 
     def prepare_before_cuda_graph_capture(self, model_runner) -> None:
+        from sglang.srt.layers import gfx1201_fp8_lm_head
+
+        gfx1201_fp8_lm_head.prepare_model(self)
         if _gfx1201_packed_gdn_in_proj:
             layers = [m for m in self.modules() if isinstance(m, Qwen3_5GatedDeltaNet)]
             packed = sum(int(m.finalize_gfx1201_mxfp4_in_proj()) for m in layers)
@@ -2506,6 +2509,10 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         return self.model.get_hidden_dim(module_name, layer_idx)
 
     def prepare_before_cuda_graph_capture(self, model_runner) -> None:
+        from sglang.srt.layers import gfx1201_fp8_lm_head
+
+        # The head lives on this wrapper, outside the language model.
+        gfx1201_fp8_lm_head.prepare_model(self)
         prepare = getattr(self.model, "prepare_before_cuda_graph_capture", None)
         if prepare is not None:
             prepare(model_runner)
