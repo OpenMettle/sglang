@@ -31,6 +31,7 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
         index_slots(cache, cache.tree_components)
         cache.is_swa_enabled = False
         cache.evicts_by_joint_lru = False
+        cache.swa_checkpoint_windows = False
         cache.cache_controller = None
         cache.metrics_collector = None
         cache.tree_core = MagicMock()
@@ -76,6 +77,7 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
         )
         index_slots(cache, cache.tree_components)
         cache.is_swa_enabled = tri_pool
+        cache.swa_checkpoint_windows = False
         cache.cache_controller = None
         cache.metrics_collector = None
         cache.tree_core = MagicMock()
@@ -175,6 +177,7 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
         cache.tree_components = (ComponentType.FULL, ComponentType.MAMBA)
         index_slots(cache, cache.tree_components)
         cache.is_swa_enabled = False
+        cache.swa_checkpoint_windows = False
         cache.cache_controller = None
         cache.metrics_collector = None
         cache.tree_core = MagicMock()

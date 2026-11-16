@@ -59,6 +59,8 @@ class CacheInitParams:
     # paged SWA pool only a draft uses), so it must not gate prefix matching.
     swa_gates_prefix_match: bool = True
     decoder_swa_bounded_replay: bool = False
+    # Keep SWA KV only for the window before each cached Mamba checkpoint, and evict it with that checkpoint.
+    swa_checkpoint_windows: bool = False
 
     # The prefix tree's slots in drive order; the KV storage supplies them.
     tree_slots: Optional[tuple[TreeSlot, ...]] = None
