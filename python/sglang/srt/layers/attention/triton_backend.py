@@ -61,7 +61,6 @@ from sglang.srt.utils import (
     is_hip,
     is_xpu,
     next_power_of_2,
-    use_gfx115_kernels,
 )
 
 _is_cuda = is_cuda()
@@ -255,9 +254,12 @@ class TritonAttnBackend(AttentionBackend):
             self.use_mla,
             self.use_verify_splitkv,
         )
-        # gfx1151 verify attention reads full-space slot ids straight from req_to_token
+        # gfx1151 verify attention reads full-space slot ids straight from req_to_token;
+        # SGLANG_GFX1201_VERIFY_ATTENTION=1 also runs it on gfx1201
+        from sglang.kernels.ops.attention import verify_attention_gfx1151
+
         self.use_verify_gfx115 = (
-            use_gfx115_kernels()
+            verify_attention_gfx1151.enabled()
             and self.page_size == 1
             and not self.runner_ids.is_translating
         )

@@ -15,15 +15,40 @@ gfx1151 with Qwen3.8 shapes (24 q heads, 4 kv heads, head dim 256) this takes 0.
 ``extend_attention_fwd``.
 """
 
+import logging
+from functools import lru_cache
+
 import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.utils import use_gfx115_kernels
+from sglang.srt.utils import get_bool_env_var, is_hip, use_gfx115_kernels
+
+logger = logging.getLogger(__name__)
 
 # (BT, warps, HG) = (32, 4, 6) and 20 splits per kv head, swept on gfx1151 with Qwen3.8
 # shapes; HG = 3 avoids the accumulator's register spills but is 2-3x slower
 NSPLIT = 20
+# gfx1201 (R9700, 64 CUs), Qwen3.8 at TP2 (12 q heads, 2 kv heads): 32 splits is the best
+# single setting for one and two requests from 1k to 88k prefixes (20 to 96 swept)
+NSPLIT_GFX1201 = 32
+_routed = set()
+
+
+@lru_cache(maxsize=1)
+def gfx1201_enabled() -> bool:
+    """SGLANG_GFX1201_VERIFY_ATTENTION=1 on gfx1201: run target verify through this kernel."""
+    if not (is_hip() and get_bool_env_var("SGLANG_GFX1201_VERIFY_ATTENTION")):
+        return False
+    try:
+        return torch.cuda.get_device_properties(0).gcnArchName.split(":")[0] == "gfx1201"
+    except Exception:
+        return False
+
+
+def enabled() -> bool:
+    """The kernel serves target verify on this device."""
+    return use_gfx115_kernels() or gfx1201_enabled()
 
 
 @triton.jit
@@ -159,7 +184,7 @@ def covered(q, o, k_buffer, v_buffer, num_tokens_per_req, hq, hkv, d) -> bool:
     tokens per request and 8 q heads per kv head, dense ``[B * T, H, D]`` q and o (the
     kernel addresses them without strides), int32-addressable contiguous caches."""
     return (
-        use_gfx115_kernels()
+        enabled()
         and 0 < num_tokens_per_req <= 8
         and hq % hkv == 0
         and hq // hkv <= 8
@@ -185,7 +210,7 @@ def verify_attention_gfx1151(
     seq_lens,
     num_tokens_per_req,
     scale,
-    nsplit=NSPLIT,
+    nsplit=None,
     bt=32,
     num_warps=4,
     hg=6,
@@ -197,6 +222,14 @@ def verify_attention_gfx1151(
     hkv = k_buffer.shape[1]
     T = num_tokens_per_req
     B = rows // T
+    if nsplit is None:
+        nsplit = NSPLIT_GFX1201 if gfx1201_enabled() else NSPLIT
+    if (B, T, hq, hkv) not in _routed:
+        _routed.add((B, T, hq, hkv))
+        logger.info(
+            "Verify attention (gfx115x kernel) route: %d requests x %d tokens, %d q / %d kv heads, %d splits",
+            B, T, hq, hkv, nsplit,
+        )
     part = torch.empty(rows * hq * nsplit, d, device=q.device, dtype=torch.float32)
     ml = torch.empty(rows * hq * nsplit, 2, device=q.device, dtype=torch.float32)
     ng = -(-(hq // hkv) // hg)
