@@ -432,6 +432,22 @@ def get_dflash_attention_sliding_window_size(config: Any) -> Optional[int]:
     return int(sliding_window) - 1
 
 
+def draft_kv_bundle_window(draft_hf_config: Any) -> int:
+    """How many tokens before the committed length a bundled draft reads."""
+    layer_types = get_dflash_layer_types(draft_hf_config)
+    if not layer_types or any(t != "sliding_attention" for t in layer_types):
+        raise ValueError(
+            "--speculative-draft-kv-bundling requires a draft whose layers are all "
+            f"sliding-window, got layer_types={layer_types}."
+        )
+    window = get_dflash_attention_sliding_window_size(draft_hf_config)
+    spec = get_spec()
+    # A DFLASH compact draft cache reads at most --speculative-draft-window-size tokens back.
+    if spec.speculative_algorithm == "DFLASH" and spec.speculative_draft_window_size:
+        return min(int(spec.speculative_draft_window_size), window)
+    return window
+
+
 def _cfg_get(config: Any, key: str, default: Any = None) -> Any:
     if isinstance(config, dict):
         return config.get(key, default)
