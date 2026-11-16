@@ -1643,6 +1643,8 @@ class Envs:
     # gfx1201 MXFP4 prefill rows (1024-2048) on the P1 FP8 route: lossless FP8
     # weight expansion, FP8/G128 activations (P1-NUMERICAL-CONTRACT-v1).
     SGLANG_GFX1201_P1_PREFILL = EnvBool(False)
+    # gfx1201 extend attention (prefill) with 8 warps for head dim 256 (C4).
+    SGLANG_GFX1201_EXTEND_WARPS8 = EnvBool(False)
     SGLANG_PCIE_IPC_MAX_NUMEL = EnvInt(0)
 
     # ===================================================================

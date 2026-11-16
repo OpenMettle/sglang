@@ -32,6 +32,16 @@ from sglang.srt.utils import is_gfx95_supported, is_gfx1250_supported, is_hip
 _is_hip = is_hip()
 _is_gfx95 = _is_hip and is_gfx95_supported()
 _is_gfx1250 = _is_hip and is_gfx1250_supported()
+# gfx1201 (RDNA4) per device, read from the input's device at call time (C4).
+_GFX1201_DEVICES = {}
+
+
+def _is_gfx1201_device(device) -> bool:
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    if index not in _GFX1201_DEVICES:
+        arch = torch.cuda.get_device_properties(index).gcnArchName
+        _GFX1201_DEVICES[index] = arch.split(":")[0] == "gfx1201"
+    return _GFX1201_DEVICES[index]
 
 try:
     _triton_version_parts = tuple(
@@ -1077,6 +1087,15 @@ def extend_attention_fwd(
     num_stages = (
         _get_num_stages_for_extend_attention(Lq, Lv, BLOCK_N) if kimi_k3_shape else 1
     )
+    if (
+        _is_hip
+        and envs.SGLANG_GFX1201_EXTEND_WARPS8.get()
+        and (Lq, Lv, BLOCK_M, BLOCK_N, num_warps, num_stages) == (256, 256, 64, 64, 4, 1)
+        and _is_gfx1201_device(q_extend.device)
+    ):
+        # C4 (op 173/174): 8 warps for the gfx1201 head-dim-256 extend shape;
+        # -23% cold prefill at 64K-118K on the 0.5.21 kernel. Not bitwise.
+        num_warps = 8
 
     extra_kargs = {}
     if _is_hip:
