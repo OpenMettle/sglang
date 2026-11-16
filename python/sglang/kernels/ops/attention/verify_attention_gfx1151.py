@@ -39,6 +39,12 @@ NSPLIT_GFX1201 = 32
 # layer at 23.5k / 47k / 88k / 120k prefixes (+1.3 us at 1k); at two requests it is slower
 # than the default tile, so batches of two or more keep it.
 GFX1201_B1_TILE = (64, 8, 64)
+# With an fp8 cache under gfx1201_fp8_kv.DECODE_PAIRS, batches of one or two requests run
+# (64, 4, 64). Measured the same way against the bf16 cache on its own tile: 54.6 / 111 /
+# 207 / 369 / 506 against 56.6 / 113 / 208 / 367 / 500 us per layer at 8k / 23.5k / 47k /
+# 88k / 123k for one request, 312 against 367 us at 47k for two; with 8 warps the fp8 cache
+# took 246 / 440 us at 47k / 88k.
+GFX1201_FP8_B1_TILE = (64, 4, 64)
 _routed = set()
 
 
@@ -84,6 +90,7 @@ def _verify_split_kernel(
     BT: tl.constexpr,
     HG: tl.constexpr,
     QC: tl.constexpr,
+    DECODE: tl.constexpr = 0,
 ):
     """One program per (request, kv head, group of ``HG`` of its q heads, split); rows are
     (block token, q head of the group), 8 x next_pow2(HG). The groups of a kv head are
@@ -114,6 +121,11 @@ def _verify_split_kernel(
     # padding rows read a real q row (finite scores) and are never stored
     q_rows = q_ptr + tl.where(valid, qrow, b * T * HQ + j * GQ)[:, None] * D
     bt = tl.arange(0, BT)
+    # gfx1201_fp8_kv.DECODE_PAIRS reads the fp8 cache as 16-bit pairs (in uint16 units)
+    k16 = k_ptr.to(tl.pointer_type(tl.uint16))
+    v16 = v_ptr.to(tl.pointer_type(tl.uint16))
+    dq2 = tl.arange(0, QC // 2)
+    d2 = tl.arange(0, D // 2)
     m_i = tl.full((R,), float("-inf"), tl.float32)
     l_i = tl.zeros((R,), tl.float32)
     acc = tl.zeros((R, D), tl.float32)
@@ -130,12 +142,33 @@ def _verify_split_kernel(
             qc = tl.load(q_rows + c + dq[None, :], volatile=True)
             # bf16 operands for both dots; a no-op for a bf16 cache, the dequant of an
             # fp8 one (gfx1201_fp8_kv; the caller folds k_scale into scale)
-            kc = tl.load(
-                tl.max_contiguous(
-                    tl.multiple_of(k_ptr + base[:, None] + c + dq[None, :], [1, 16]),
-                    [1, 8],
+            if DECODE == 2:
+                kc = gfx1201_fp8_kv.e4m3fn_pairs_to_bf16(
+                    tl.load(
+                        tl.max_contiguous(
+                            tl.multiple_of(
+                                k16 + (base // 2)[:, None] + c // 2 + dq2[None, :], [1, 8]
+                            ),
+                            [1, 8],
+                        )
+                    )
                 )
-            ).to(tl.bfloat16)
+            elif DECODE == 1:
+                kc = gfx1201_fp8_kv.e4m3fn_to_bf16(
+                    tl.load(
+                        tl.max_contiguous(
+                            tl.multiple_of(k_ptr + base[:, None] + c + dq[None, :], [1, 16]),
+                            [1, 16],
+                        )
+                    )
+                )
+            else:
+                kc = tl.load(
+                    tl.max_contiguous(
+                        tl.multiple_of(k_ptr + base[:, None] + c + dq[None, :], [1, 16]),
+                        [1, 8],
+                    )
+                ).to(tl.bfloat16)
             sc = tl.dot(qc, tl.trans(kc), sc)
         sc = sc * scale
         off = base[:, None] + d[None, :]
@@ -147,9 +180,23 @@ def _verify_split_kernel(
         p = tl.exp(sc - m_safe[:, None])
         alpha = tl.exp(m_i - m_safe)
         l_i = l_i * alpha + tl.sum(p, axis=1)
-        v = tl.load(tl.max_contiguous(tl.multiple_of(v_ptr + off, [1, 16]), [1, 8])).to(
-            tl.bfloat16
-        )
+        if DECODE == 2:
+            v = gfx1201_fp8_kv.e4m3fn_pairs_to_bf16(
+                tl.load(
+                    tl.max_contiguous(
+                        tl.multiple_of(v16 + (base // 2)[:, None] + d2[None, :], [1, 8]),
+                        [1, 8],
+                    )
+                )
+            )
+        elif DECODE == 1:
+            v = gfx1201_fp8_kv.e4m3fn_to_bf16(
+                tl.load(tl.max_contiguous(tl.multiple_of(v_ptr + off, [1, 16]), [1, 16]))
+            )
+        else:
+            v = tl.load(
+                tl.max_contiguous(tl.multiple_of(v_ptr + off, [1, 16]), [1, 8])
+            ).to(tl.bfloat16)
         acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), v)
         m_i = m_new
     # partial row of (request token row, q head, split)
@@ -250,7 +297,13 @@ def verify_attention_gfx1151(
     B = rows // T
     if nsplit is None:
         nsplit = NSPLIT_GFX1201 if gfx1201_enabled() else NSPLIT
-    tile = GFX1201_B1_TILE if B == 1 and gfx1201_b1_tile_enabled() else (32, 4, 32)
+    decode = gfx1201_fp8_kv.decode(q, k_buffer, v_buffer, pairs=True)
+    if B <= 2 and decode == gfx1201_fp8_kv.DECODE_PAIRS and gfx1201_b1_tile_enabled():
+        tile = GFX1201_FP8_B1_TILE
+    elif B == 1 and gfx1201_b1_tile_enabled():
+        tile = GFX1201_B1_TILE
+    else:
+        tile = (32, 4, 32)
     bt = tile[0] if bt is None else bt
     num_warps = tile[1] if num_warps is None else num_warps
     qc = tile[2] if qc is None else qc
@@ -258,8 +311,8 @@ def verify_attention_gfx1151(
         _routed.add((B, T, hq, hkv))
         logger.info(
             "Verify attention (gfx115x kernel) route: %d requests x %d tokens, %d q / %d kv heads, %d splits, "
-            "tile BT %d / %d warps / QC %d",
-            B, T, hq, hkv, nsplit, bt, num_warps, qc,
+            "tile BT %d / %d warps / QC %d, kv decode %d",
+            B, T, hq, hkv, nsplit, bt, num_warps, qc, decode,
         )
     part = torch.empty(rows * hq * nsplit, d, device=q.device, dtype=torch.float32)
     ml = torch.empty(rows * hq * nsplit, 2, device=q.device, dtype=torch.float32)
@@ -283,6 +336,7 @@ def verify_attention_gfx1151(
         BT=bt,
         HG=hg,
         QC=qc,
+        DECODE=decode,
         num_warps=num_warps,
         # the default software pipelining doubles the LDS and adds spills
         num_stages=1,

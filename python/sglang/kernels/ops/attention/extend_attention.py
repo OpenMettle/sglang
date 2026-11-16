@@ -460,6 +460,8 @@ def _fwd_kernel(
     IS_GFX1250: tl.constexpr = False,
     # gfx1201_fp8_kv: cast the fp8 prefix K/V tiles to q's dtype (bf16) for both dots
     KV_DEQUANT: tl.constexpr = False,
+    # gfx1201_fp8_kv.DECODE_HW: decode the e4m3fn tiles with v_cvt_f32_fp8 (bit-identical)
+    KV_DECODE: tl.constexpr = 0,
     PAGE_SIZE: tl.constexpr = 1,
     IDENTITY_KV_INDICES: tl.constexpr = False,
     SCORE_MOD: tl.constexpr = None,
@@ -640,7 +642,9 @@ def _fwd_kernel(
             # downcasting q to fp8. No-op for a bf16 cache. (Do NOT revert to q.to(fp8).)
             # On all other platforms keep the original q.to(k.dtype) downcast.
             # TODO: remove this branch once the gfx1250 fp8 tl.dot issue is resolved.
-            if IS_GFX1250 or KV_DEQUANT:
+            if KV_DECODE == 1:
+                qk = tl.dot(q, gfx1201_fp8_kv.e4m3fn_to_bf16(k))
+            elif IS_GFX1250 or KV_DEQUANT:
                 qk = tl.dot(q, k.to(q.dtype))
             else:
                 qk = tl.dot(q.to(k.dtype), k)
@@ -735,6 +739,8 @@ def _fwd_kernel(
                 # TODO: remove this branch once the gfx1250 bf16 P·V issue is resolved.
                 if IS_GFX1250:
                     dot = tl.dot(p, v.to(tl.float32), out_dtype=tl.float32)
+                elif KV_DECODE == 1:
+                    dot = tl.dot(p.to(q.dtype), gfx1201_fp8_kv.e4m3fn_to_bf16(v))
                 elif KV_DEQUANT:
                     dot = tl.dot(p.to(q.dtype), v.to(q.dtype))
                 else:
@@ -1200,6 +1206,7 @@ def extend_attention_fwd(
         HAS_SINK=HAS_SINK,
         IS_GFX1250=_is_gfx1250,
         KV_DEQUANT=gfx1201_fp8_kv.applies(k_buffer, v_buffer),
+        KV_DECODE=gfx1201_fp8_kv.decode(q_extend, k_buffer, v_buffer),
         STORE_TRANSPOSE=_is_hip,
         USE_COMPACT_TILE_GRID=use_compact_tile_grid,
         USE_EXP2=USE_EXP2,

@@ -560,6 +560,8 @@ def _fwd_grouped_kernel_stage1(
     IS_GFX1250: tl.constexpr = False,
     # gfx1201_fp8_kv: keep q and p in bf16 and cast the fp8 K/V tiles up for both dots
     KV_DEQUANT: tl.constexpr = False,
+    # gfx1201_fp8_kv.DECODE_HW: decode the e4m3fn tiles with v_cvt_f32_fp8 (bit-identical)
+    KV_DECODE: tl.constexpr = 0,
     PAGE_SIZE: tl.constexpr = 1,
     SCORE_MOD: tl.constexpr = None,
     Aux0=None,
@@ -680,7 +682,9 @@ def _fwd_grouped_kernel_stage1(
                 mask=(offs_n[None, :] < split_kv_end) & (mask_d[:, None]),
                 other=0.0,
             )
-            if IS_GFX1250 or KV_DEQUANT:
+            if KV_DECODE == 1:
+                qk = tl.dot(q_k, gfx1201_fp8_kv.e4m3fn_to_bf16(k))
+            elif IS_GFX1250 or KV_DEQUANT:
                 qk = tl.dot(q_k, k.to(q_k.dtype))
             else:
                 qk = tl.dot(q_k, k)
@@ -752,6 +756,8 @@ def _fwd_grouped_kernel_stage1(
             # TODO: remove this branch once the gfx1250 bf16 P·V issue is resolved.
             if IS_GFX1250:
                 acc += tl.dot(p, v.to(tl.float32), out_dtype=tl.float32)
+            elif KV_DECODE == 1:
+                acc += tl.dot(p.to(q.dtype), gfx1201_fp8_kv.e4m3fn_to_bf16(v))
             elif KV_DEQUANT:
                 acc += tl.dot(p.to(q.dtype), v.to(q.dtype))
             else:
@@ -914,6 +920,7 @@ def _decode_grouped_att_m_fwd(
         USE_PDL=use_pdl,
         IS_GFX1250=_is_gfx1250,
         KV_DEQUANT=gfx1201_fp8_kv.applies(k_buffer, v_buffer),
+        KV_DECODE=gfx1201_fp8_kv.decode(q, k_buffer, v_buffer),
         PAGE_SIZE=page_size,
         SCORE_MOD=score_mod,
         Aux0=aux0,
