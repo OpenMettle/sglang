@@ -1645,6 +1645,9 @@ class Envs:
     SGLANG_GFX1201_P1_PREFILL = EnvBool(False)
     # gfx1201 extend attention (prefill) with 8 warps for head dim 256 (C4).
     SGLANG_GFX1201_EXTEND_WARPS8 = EnvBool(False)
+    # DFLASH fused KV materialization for a draft quantized to per-tensor or
+    # per-channel FP8: the helper's stacked K/V weight is dequantized to BF16.
+    SGLANG_DFLASH_FUSED_KV_FP8 = EnvBool(False)
     SGLANG_PCIE_IPC_MAX_NUMEL = EnvInt(0)
 
     # ===================================================================

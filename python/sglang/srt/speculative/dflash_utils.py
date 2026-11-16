@@ -13,6 +13,7 @@ from sglang.kernels.ops.sampling import argmax as sampling_argmax
 from sglang.kernels.ops.speculative.verify_sampling import (
     tree_speculative_sampling_target_only,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.sampler import (
     apply_custom_logit_processor,
@@ -922,9 +923,39 @@ def can_dflash_slice_qkv_weight(qkv_proj: Any) -> Tuple[bool, str]:
     return True, ""
 
 
+_FP8_WEIGHT_DTYPES = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+
+
+def is_dflash_dequantizable_fp8_qkv(qkv_proj: Any) -> bool:
+    """Whether a QKV layer holds a non-block FP8 weight, stored (K, N) for
+    apply_fp8_linear, with a per-tensor or per-output-channel scale, which the
+    fused KV helper can dequantize once."""
+    from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+
+    quant_method = getattr(qkv_proj, "quant_method", None)
+    weight = getattr(qkv_proj, "weight", None)
+    scale = getattr(qkv_proj, "weight_scale", None)
+    n = getattr(qkv_proj, "output_size_per_partition", None)
+    return (
+        isinstance(quant_method, Fp8LinearMethod)
+        and not getattr(quant_method, "block_quant", False)
+        and not getattr(quant_method, "use_marlin", False)
+        and weight is not None
+        and weight.dtype in _FP8_WEIGHT_DTYPES
+        and weight.dim() == 2
+        and scale is not None
+        and n is not None
+        and weight.shape[1] == n
+        and scale.numel() in (1, int(n))
+    )
+
+
 def can_dflash_use_fused_qkv_proj(qkv_proj: Any) -> Tuple[bool, str]:
     """Validate whether a QKV layer is eligible for DFlash fused KV materialization."""
     eligible, reason = can_dflash_slice_qkv_weight(qkv_proj)
+    if not eligible and envs.SGLANG_DFLASH_FUSED_KV_FP8.get():
+        if is_dflash_dequantizable_fp8_qkv(qkv_proj):
+            eligible, reason = True, ""
     if not eligible:
         return False, reason
     if getattr(qkv_proj, "bias", None) is not None:

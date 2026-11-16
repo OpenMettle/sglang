@@ -239,6 +239,33 @@ def _fused_norm_rope_stacked(
     return k_out, v_out
 
 
+def _dense_kv_rows(qkv_proj, start: int, stop: int, dtype: torch.dtype) -> torch.Tensor:
+    """Rows [start, stop) of a QKV weight as a dense (rows, K) matrix.
+
+    BF16/FP16 weights are sliced as before. A non-block FP8 weight is stored
+    transposed, (K, N), as Fp8LinearMethod keeps it for apply_fp8_linear, and
+    is dequantized with its per-tensor or per-output-channel scale.
+    """
+    weight = qkv_proj.weight
+    if weight.dtype not in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+        return weight[start:stop]
+    n = int(qkv_proj.output_size_per_partition)
+    if weight.dim() != 2 or weight.shape[1] != n:
+        raise ValueError(f"unsupported FP8 qkv weight layout {tuple(qkv_proj.weight.shape)}")
+    weight = weight.t()
+    if weight.shape[0] != n:
+        raise ValueError(f"unsupported FP8 qkv weight layout {tuple(qkv_proj.weight.shape)}")
+    scale = qkv_proj.weight_scale.float()
+    rows = weight[start:stop].float()
+    if scale.numel() == 1:
+        rows = rows * scale.reshape(())
+    elif scale.numel() == n:
+        rows = rows * scale.reshape(-1)[start:stop, None]
+    else:
+        raise ValueError(f"unsupported FP8 qkv weight scale shape {tuple(scale.shape)}")
+    return rows.to(dtype)
+
+
 class FusedKVMaterializeHelper:
     """Fused KV materialization helper using batched projection.
 
@@ -319,8 +346,12 @@ class FusedKVMaterializeHelper:
                     f"got (rotary_dim={layer_rotary_dim}, neox={layer_is_neox}) at layer {layer_id}."
                 )
 
-            qkv_w = attn.qkv_proj.weight
-            kv_weight = qkv_w[attn.q_size : attn.q_size + 2 * attn.kv_size]
+            kv_weight = _dense_kv_rows(
+                attn.qkv_proj,
+                attn.q_size,
+                attn.q_size + 2 * attn.kv_size,
+                attn.k_norm.weight.dtype,
+            )
             kv_weights.append(kv_weight)
             k_norm_weights.append(attn.k_norm.weight)
             eps_values.append(float(attn.k_norm.variance_epsilon))
