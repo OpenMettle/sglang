@@ -1636,6 +1636,10 @@ class Envs:
     SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PUSH_SIZE_KB = EnvInt(None)
     # See docs/references/environment_variables.
     SGLANG_ENABLE_PCIE_IPC_ALLREDUCE = EnvBool(False)
+    # Two gfx1201 GPUs over PCIe: SGLang's HIP custom all-reduce (1-stage) for
+    # reductions up to the byte limit (decode/verify sizes); larger ones use RCCL.
+    SGLANG_GFX1201_PCIE_CUSTOM_AR = EnvBool(False)
+    SGLANG_GFX1201_PCIE_CUSTOM_AR_MAX_BYTES = EnvInt(512 * 1024)
     SGLANG_PCIE_IPC_MAX_NUMEL = EnvInt(0)
 
     # ===================================================================

@@ -74,6 +74,21 @@ struct packed_t {
 
 #define DINLINE __device__ __forceinline__
 
+// gfx12 (RDNA4) peers reach each other over PCIe without cache coherence: a
+// relaxed start flag can reach the peer before this rank's input has left its
+// L2, and the peer then reads stale data (wrong, rank-divergent sums measured on
+// two R9700s). There the start flag is a system-scope release and its wait a
+// system-scope acquire. XGMI (gfx94x/gfx95x) builds keep the relaxed flags.
+#if defined(__gfx1200__) || defined(__gfx1201__)
+#define SGL_CAR_START_STORE_ORDER __ATOMIC_RELEASE
+#define SGL_CAR_START_LOAD_ORDER __ATOMIC_ACQUIRE
+#define SGL_CAR_START_LOAD_SCOPE __MEMORY_SCOPE_SYSTEM
+#else
+#define SGL_CAR_START_STORE_ORDER __ATOMIC_RELAXED
+#define SGL_CAR_START_LOAD_ORDER __ATOMIC_RELAXED
+#define SGL_CAR_START_LOAD_SCOPE __MEMORY_SCOPE_DEVICE
+#endif
+
 // scalar cast functions
 DINLINE float upcast_s(half val) {
   return __half2float(val);
@@ -166,10 +181,10 @@ DINLINE void start_sync(
     // simultaneously write to the corresponding flag of all ranks.
     // Latency = 1 p2p write
     __scoped_atomic_store_n(
-        &sg.signals[threadIdx.x]->start[blockIdx.x][rank], flag, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
+        &sg.signals[threadIdx.x]->start[blockIdx.x][rank], flag, SGL_CAR_START_STORE_ORDER, __MEMORY_SCOPE_SYSTEM);
     // wait until we got true from all ranks
-    while (__scoped_atomic_load_n(&self_sg->start[blockIdx.x][threadIdx.x], __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE) <
-           flag)
+    while (__scoped_atomic_load_n(
+               &self_sg->start[blockIdx.x][threadIdx.x], SGL_CAR_START_LOAD_ORDER, SGL_CAR_START_LOAD_SCOPE) < flag)
       ;
   }
   __syncthreads();

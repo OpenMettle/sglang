@@ -67,6 +67,7 @@ class CustomAllreduce:
         are in the same node.
         """
         self._IS_CAPTURING = False
+        self.pcie_two_gpu = False
         self.disabled = True  # This can be modified in-place by context manager in piecewise cuda graph runner
         self.original_disabled = True  # To store the original state
         self.use_amd_deterministic_impl = _use_amd_deterministic_impl()
@@ -86,14 +87,26 @@ class CustomAllreduce:
         # now `device` is a `torch.device` object
         assert isinstance(device, torch.device)
         self.device = device
-        full_nvlink = can_use_custom_all_reduce_with_nvlink(
-            group=group,
-            device=device,
-            supported_world_size=self._SUPPORTED_WORLD_SIZES,
-            cls_name="CustomAllreduce",
-        )
-        if full_nvlink is None:
-            return  # fail to get nvlink status
+        # SGLANG_GFX1201_PCIE_CUSTOM_AR=1: two gfx1201 GPUs over PCIe, which the
+        # XGMI check (and its amdsmi dependency) rejects. Decode-sized reductions
+        # only; larger ones (prefill chunks) stay on RCCL.
+        # The cap applies in should_custom_ar only: the IPC buffers keep their size,
+        # because a small torch allocation is not the base of its own hipMalloc
+        # block and hipIpcGetMemHandle rejects it.
+        self.pcie_two_gpu = _pcie_two_gpu(world_size, device)
+        if self.pcie_two_gpu:
+            full_nvlink = False
+            self.pcie_max_bytes = min(max_size, envs.SGLANG_GFX1201_PCIE_CUSTOM_AR_MAX_BYTES.get())
+            log_info_on_rank0(logger, f"[AR] gfx1201 PCIe custom all-reduce, up to {self.pcie_max_bytes} bytes")
+        else:
+            full_nvlink = can_use_custom_all_reduce_with_nvlink(
+                group=group,
+                device=device,
+                supported_world_size=self._SUPPORTED_WORLD_SIZES,
+                cls_name="CustomAllreduce",
+            )
+            if full_nvlink is None:
+                return  # fail to get nvlink status
 
         self.group = group
         self.max_size = max_size
@@ -280,6 +293,8 @@ class CustomAllreduce:
         if _is_hip:
             if self.use_amd_deterministic_impl:
                 return True
+            if self.pcie_two_gpu:
+                return inp_size <= self.pcie_max_bytes
             if self.full_nvlink:
                 return inp_size <= self.max_size
             return False
@@ -445,6 +460,16 @@ def dispatch_custom_allreduce(
             return CustomAllreduce
 
     return CustomAllreduce
+
+
+def _pcie_two_gpu(world_size: int, device: torch.device) -> bool:
+    """SGLANG_GFX1201_PCIE_CUSTOM_AR=1 on two gfx1201 GPUs that can reach each other."""
+    if not (_is_hip and world_size == 2 and envs.SGLANG_GFX1201_PCIE_CUSTOM_AR.get()):
+        return False
+    if torch.cuda.get_device_properties(device).gcnArchName.split(":")[0] != "gfx1201":
+        return False
+    peer = 1 - (device.index or 0) if torch.cuda.device_count() == 2 else None
+    return peer is not None and torch.cuda.can_device_access_peer(device.index or 0, peer)
 
 
 def _use_amd_deterministic_impl() -> bool:
