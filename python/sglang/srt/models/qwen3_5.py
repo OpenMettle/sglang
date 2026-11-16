@@ -173,6 +173,36 @@ _gfx1201_packed_gdn_in_proj = (
     _is_hip and not _use_aiter and get_bool_env_var("SGLANG_GFX1201_PACKED_GDN_IN_PROJ")
 )
 _GFX1201_PACKED_ROWS = (8, 16)
+# gfx1201: the norm read hands MXFP4 projections their quantized input
+# (gfx1201_add_norm_mxfp4) on verify batches; any other read stays BF16.
+_gfx1201_add_norm_mxfp4 = (
+    _is_hip and not _use_aiter and envs.SGLANG_GFX1201_ADD_NORM_MXFP4.get()
+)
+
+
+def _gfx1201_norm_quant_read(stage, forward_batch, consumers_ready: bool) -> dict:
+    """Read options for a boundary whose consumers all take a pre-quantized
+    (packed MXFP4, scales) input; the read may still return BF16."""
+    if (
+        _gfx1201_add_norm_mxfp4
+        and consumers_ready
+        and forward_batch is not None
+        and forward_batch.forward_mode.is_target_verify()
+        and stage.reads_quantized(forward_batch)
+    ):
+        return {"quant_format": "mxfp4_gfx1201"}
+    return {}
+
+
+def _is_gfx1201_mxfp4_linear(linear) -> bool:
+    from sglang.srt.layers.quantization.quark.schemes import quark_w4a4_mxfp4
+
+    return (
+        quark_w4a4_mxfp4._use_gfx1201_mxfp4
+        and type(getattr(linear, "scheme", None)) is quark_w4a4_mxfp4.QuarkW4A4MXFP4
+        and getattr(linear, "bias", None) is None
+        and not getattr(linear, "dequantized_bf16", False)
+    )
 if _use_aiter:
     from aiter.tuned_gemm import tgemm
 
@@ -257,9 +287,14 @@ def _qwen3_5_stage_facts(
     read, which declares what the plain one does and also hands on the
     quantized input its projection takes."""
     sparse = _qwen3_5_is_moe(config)
+    # gfx1201 add+norm+MXFP4: the dense FFN's read must also take quant_format
+    # (as upstream qwen3 declares it); with an empty format it is the plain read.
+    ffn_read = (
+        {"read": NORM_QUANT_READOUT} if _gfx1201_add_norm_mxfp4 and not sparse else {}
+    )
     return (
         declare_attn(read=attn_read),
-        declare_ffn(sparse=sparse, next_layer_sparse=sparse),
+        declare_ffn(sparse=sparse, next_layer_sparse=sparse, **ffn_read),
     )
 
 
@@ -923,6 +958,30 @@ class Qwen3_5GatedDeltaNet(nn.Module):
     def _forward_input_proj(self, hidden_states: torch.Tensor):
         if (
             self._gfx1201_in_proj is not None
+            and isinstance(hidden_states, tuple)
+            and len(hidden_states) == 2
+            and hidden_states[0].dtype == torch.uint8
+            and hidden_states[0].shape[0] in _GFX1201_PACKED_ROWS
+        ):
+            from sglang.srt.layers.quantization.quark.schemes.gfx1201_mxfp4 import (
+                gemm_afp4wfp4,
+            )
+
+            x_q, x_s = hidden_states
+            weight, scale, rows = self._gfx1201_in_proj
+            if not getattr(Qwen3_5GatedDeltaNet, "_gfx1201_prequant_logged", False):
+                Qwen3_5GatedDeltaNet._gfx1201_prequant_logged = True
+                logger.info(
+                    "Packed MXFP4 GDN input projection (gfx1201) takes the quantized norm read: %d rows",
+                    x_q.shape[0],
+                )
+            out = torch.empty(
+                (x_q.shape[0], weight.shape[0]), dtype=torch.bfloat16, device=x_q.device
+            )
+            gemm_afp4wfp4(x_q, weight, x_s, scale, torch.bfloat16, out)
+            return out[:, :rows], out[:, rows:]
+        if (
+            self._gfx1201_in_proj is not None
             and isinstance(hidden_states, torch.Tensor)
             and hidden_states.dim() == 2
             and hidden_states.dtype == torch.bfloat16
@@ -1350,6 +1409,11 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             hidden_states,
             forward_batch,
             capture_gathered=kwargs.get("captured_last_layer_outputs", None),
+            **_gfx1201_norm_quant_read(
+                self.attn_boundary,
+                forward_batch,
+                getattr(self.linear_attn, "_gfx1201_in_proj", None) is not None,
+            ),
         )
 
         # fused AR+quant hands down a (fp8, scale) / (bf16, fp8, scale) tuple
@@ -1362,7 +1426,16 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
-        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(
+            hidden_states,
+            forward_batch,
+            **_gfx1201_norm_quant_read(
+                self.ffn_boundary,
+                forward_batch,
+                not isinstance(self.mlp, Qwen2MoeSparseMoeBlock)
+                and _is_gfx1201_mxfp4_linear(getattr(self.mlp, "gate_up_proj", None)),
+            ),
+        )
 
         with self.ffn_boundary.exit(forward_batch) as ffn_exit:
             if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
@@ -1798,6 +1871,11 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             hidden_states,
             forward_batch,
             capture_gathered=captured_last_layer_outputs,
+            **_gfx1201_norm_quant_read(
+                self.attn_boundary,
+                forward_batch,
+                _is_gfx1201_mxfp4_linear(getattr(self, "qkv_proj", None)),
+            ),
         )
 
         # fused AR+quant hands down a (fp8, scale) / (bf16, fp8, scale) tuple
@@ -1811,7 +1889,16 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
-        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(
+            hidden_states,
+            forward_batch,
+            **_gfx1201_norm_quant_read(
+                self.ffn_boundary,
+                forward_batch,
+                not isinstance(self.mlp, Qwen2MoeSparseMoeBlock)
+                and _is_gfx1201_mxfp4_linear(getattr(self.mlp, "gate_up_proj", None)),
+            ),
+        )
         with self.ffn_boundary.exit(forward_batch) as ffn_exit:
             if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
                 hidden_states = self.mlp(

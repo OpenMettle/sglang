@@ -1648,6 +1648,9 @@ class Envs:
     # DFLASH fused KV materialization for a draft quantized to per-tensor or
     # per-channel FP8: the helper's stacked K/V weight is dequantized to BF16.
     SGLANG_DFLASH_FUSED_KV_FP8 = EnvBool(False)
+    # gfx1201: residual add + Gemma RMSNorm + MXFP4 quantization in one kernel
+    # for the MXFP4 projections that read the norm on verify-sized batches.
+    SGLANG_GFX1201_ADD_NORM_MXFP4 = EnvBool(False)
     SGLANG_PCIE_IPC_MAX_NUMEL = EnvInt(0)
 
     # ===================================================================

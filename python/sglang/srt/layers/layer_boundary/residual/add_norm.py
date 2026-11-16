@@ -14,6 +14,7 @@
 """The plain residual: add and RMSNorm, and the fused all-reduce + add + norm
 kernels."""
 
+import logging
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Optional
@@ -193,6 +194,49 @@ def _update_and_read_residual_plain(
     return norm(hidden_states, residual, post_residual_addition)
 
 
+_gfx1201_mxfp4_read_logged = False
+
+
+def _update_and_read_residual_gfx1201_mxfp4(
+    norm, hidden_states, residual, post_residual_addition
+):
+    """gfx1201: (packed MXFP4, scales) for a Gemma norm on verify-sized rows, in one
+    kernel that is bitwise equal to the plain path's Triton Gemma add+norm followed by
+    the gfx1201 MXFP4 quantizer. Every other case returns the plain BF16 read."""
+    from sglang.srt.layers import layernorm as _ln
+
+    if (
+        residual is None
+        or post_residual_addition is not None
+        or not isinstance(norm, GemmaRMSNorm)
+        or hidden_states.dim() != 2
+        or hidden_states.dtype != torch.bfloat16
+        or hidden_states.shape[0] not in (8, 16)
+        # the plain path must be the Triton Gemma add+norm with round_sum=True
+        or _ln._use_aiter
+        or _ln._has_vllm_rms_norm
+        or not _ln._has_rocm_triton_gemma_rms_norm
+    ):
+        return _update_and_read_residual_plain(
+            norm, hidden_states, residual, post_residual_addition
+        )
+    from sglang.srt.layers.quantization.quark.schemes.gfx1201_add_norm_mxfp4 import (
+        gemma_add_rmsnorm_mxfp4,
+    )
+
+    global _gfx1201_mxfp4_read_logged
+    if not _gfx1201_mxfp4_read_logged:
+        _gfx1201_mxfp4_read_logged = True
+        logging.getLogger(__name__).info(
+            "gfx1201 add+norm+MXFP4 read engaged: %d rows, hidden %d",
+            hidden_states.shape[0],
+            hidden_states.shape[1],
+        )
+    return gemma_add_rmsnorm_mxfp4(
+        hidden_states, residual, norm.weight.data, norm.variance_epsilon
+    )
+
+
 def _update_and_read_residual_aiter_mxfp4(
     norm, hidden_states, residual, post_residual_addition
 ):
@@ -271,6 +315,8 @@ def _norm_quant_kernel(quant_format: str):
     input from it: the input norm, fused with the quantization this format
     wants. Without a residual (the first layer, or one already folded into
     hidden_states) the input itself becomes the residual."""
+    if quant_format == "mxfp4_gfx1201":
+        return _update_and_read_residual_gfx1201_mxfp4
     if _use_aiter and _is_gfx95_supported and "mxfp4" in quant_format:
         return _update_and_read_residual_aiter_mxfp4
     if _use_aiter and _is_gfx95_supported and quant_format == "fp8":
