@@ -95,7 +95,8 @@ hipcc_flags = [
     "-O3",
     "-Xcompiler",
     "-fPIC",
-    "-std=c++17",
+    # Torch 2.14+ headers reject anything below C++20 with a hard #error.
+    "-std=c++20",
     f"--amdgpu-target={amdgpu_target}",
     "-DENABLE_BF16",
     "-DENABLE_FP8",
