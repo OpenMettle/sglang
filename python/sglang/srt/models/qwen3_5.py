@@ -745,6 +745,38 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         ba.weight.data = fused[self._fused_in_proj_qkvz_width :]
         self._fused_in_proj_weight = fused
 
+    def _gfx1201_norm_quant_eligible(self, x, z, heads) -> bool:
+        """The fused gated-norm MXFP4 route (gfx1201_gdn_norm_quant) applies."""
+        from sglang.srt.layers.quantization.quark.schemes import (
+            gfx1201_gdn_norm_quant,
+            quark_w4a4_mxfp4,
+        )
+
+        if not gfx1201_gdn_norm_quant.ENABLED:
+            return False
+        proj, norm = self.out_proj, self.norm
+        return (
+            quark_w4a4_mxfp4._use_gfx1201_mxfp4
+            and type(getattr(proj, "scheme", None)) is quark_w4a4_mxfp4.QuarkW4A4MXFP4
+            and proj.bias is None
+            and not getattr(proj, "use_aiter_asm_fp4_gemm", False)
+            and not getattr(proj, "dequantized_bf16", False)
+            and getattr(norm, "activation", "swish") in ("swish", "silu")
+            and getattr(norm, "norm_before_gate", True)
+            and getattr(norm, "group_size", None) is None
+            and norm.weight.dtype == torch.bfloat16
+            and x.dim() == 2
+            and z.dim() == 2
+            and x.shape == z.shape
+            and x.dtype == z.dtype == torch.bfloat16
+            and x.shape[1] == norm.weight.shape[0]
+            and x.stride(1) == 1
+            and z.stride(1) == 1
+            and x.shape[0] % heads == 0
+            and x.shape[0] // heads in gfx1201_gdn_norm_quant.TOKENS
+            and proj.weight.shape[1] * 2 == heads * x.shape[1]
+        )
+
     def finalize_gfx1201_mxfp4_in_proj(self) -> bool:
         """Pack the loaded MXFP4 QKVZ and BA shards into one weight/scale pair.
 
@@ -1171,6 +1203,18 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             core_attn_out = core_attn_out_pad
 
         nv = self.num_v_heads // self.attn_tp_size
+        if not use_strided_prefill_z and self._gfx1201_norm_quant_eligible(
+            core_attn_out, z, nv
+        ):
+            from sglang.srt.layers.quantization.quark.schemes import (
+                gfx1201_gdn_norm_quant,
+            )
+
+            # MXFP4 counterpart of the FP8 tuple path below (op234 F1).
+            packed = gfx1201_gdn_norm_quant.gated_norm_mxfp4(
+                core_attn_out, z, self.norm.weight, self.norm.eps, nv
+            )
+            return self.out_proj(packed)[0]
         if not use_strided_prefill_z and _fp8_tuple_input(self.out_proj, len(z) // nv):
             fp8, _, _ = _layer_norm_fwd(
                 core_attn_out,
