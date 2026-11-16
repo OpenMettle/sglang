@@ -1657,6 +1657,10 @@ class Envs:
     # gfx1201: target-verify attention (SGLANG_GFX1201_VERIFY_ATTENTION) with a
     # wider tile (BT 64, 8 warps, QC 64) when a batch has one request.
     SGLANG_GFX1201_VERIFY_ATTENTION_B1_TILE = EnvBool(False)
+    # gfx1201: MXFP4 GEMMs of at most 16 rows run the kq3 kernel on the shards
+    # the split-K route serves; their weights are stored as kq3 records only and
+    # rebuilt into a per-card scratch for every other GEMM.
+    SGLANG_GFX1201_MXFP4_KQ3 = EnvBool(False)
     SGLANG_PCIE_IPC_MAX_NUMEL = EnvInt(0)
 
     # ===================================================================

@@ -182,6 +182,14 @@ if _use_gfx1201_mxfp4 and envs.SGLANG_GFX1201_P1_PREFILL.get():
 
     _gfx1201_p1 = gfx1201_p1_prefill.install(torch, gfx1201_p1_prefill.SETTING)
 
+# gfx1201 kq3 (opt-in): GEMMs of at most 16 rows read the weight as kq3 records,
+# which replace the canonical weight of every shard the split-K route serves.
+_gfx1201_kq3 = None
+if _use_gfx1201_mxfp4 and envs.SGLANG_GFX1201_MXFP4_KQ3.get():
+    from sglang.srt.layers.quantization.quark.schemes import (
+        gfx1201_mxfp4_kq3 as _gfx1201_kq3,
+    )
+
 if _use_gfx1201_mxfp4:
     from sglang.srt.layers.quantization.quark.schemes.gfx1201_mxfp4 import (
         dynamic_mxfp4_quant,
@@ -458,11 +466,15 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
             return
 
         layer.use_aiter_asm_fp4_gemm = False
+        kq3 = _gfx1201_kq3.pack_layer(layer) if _gfx1201_kq3 is not None else None
         if _gfx1201_p1 is not None:
             n, k = layer.weight.shape[0], layer.weight.shape[1] * 2
             if _gfx1201_p1.admits_shape(n, k):
                 # Expand once, require zero guard flags, compile before traffic.
-                _gfx1201_p1.validate_layer(layer, n, k)
+                # A kq3 layer is validated as the canonical pair rebuilt from its records.
+                _gfx1201_p1.validate_layer(
+                    layer if kq3 is None else kq3.canonical(), n, k
+                )
         if not _use_aiter_asm_fp4_gemm or not is_gfx95_supported():
             return
 
@@ -969,6 +981,26 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
             three_d = True
             x = x.view(-1, x.shape[-1])
             output_shape = [*x.shape[:-1], layer.weight.shape[0]]
+
+        if _gfx1201_kq3 is not None and "_gfx1201_kq3" in layer.__dict__:
+            kq3 = layer._gfx1201_kq3
+            if (
+                y is None
+                and not fused_gemm_split_cat
+                and x.shape[0] <= _gfx1201_kq3.MAX_ROWS
+            ):
+                if x_s is None:
+                    x, x_s = dynamic_mxfp4_quant(x)
+                if _gfx1201_kq3.admits(kq3, x, x_s, self.out_dtype):
+                    y = torch.empty(
+                        x.shape[0], kq3.n, device=x.device, dtype=self.out_dtype
+                    )
+                    _gfx1201_kq3.gemm(kq3, x, x_s, y)
+                    if bias is not None:
+                        y = y + bias
+                    return y.view(*output_shape) if three_d else y
+            # Every other route reads the canonical weight, rebuilt from the records.
+            layer = kq3.canonical()
 
         if (
             _gfx1201_p1 is not None

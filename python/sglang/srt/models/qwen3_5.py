@@ -861,12 +861,30 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         rows = qkvz.weight.shape[0]
         weight = torch.cat([qkvz.weight.data, ba.weight.data], dim=0).contiguous()
         scale = torch.cat([qkvz.weight_scale.data, ba.weight_scale.data], dim=0).contiguous()
+        p1 = quark_w4a4_mxfp4._gfx1201_p1
+        kq3 = quark_w4a4_mxfp4._gfx1201_kq3
+        records = None
+        if kq3 is not None:
+            # kq3 records replace the packed weight; QKVZ and BA rebuild their rows from them.
+            records = kq3.pack_weight(weight, scale, ((qkvz, 0), (ba, rows)))
+        if records is not None:
+            del weight, scale
+            torch.cuda.empty_cache()
+            self._gfx1201_in_proj = (records, None, rows)
+            if p1 is not None:
+                for proj in (qkvz, ba):
+                    if p1.validated.pop(id(proj), None) is not None:
+                        p1.validate_layer(
+                            proj._gfx1201_kq3.canonical(),
+                            proj.weight.shape[0],
+                            proj.weight.shape[1] * 2,
+                        )
+            return True
         qkvz.weight.data, ba.weight.data = weight[:rows], weight[rows:]
         qkvz.weight_scale.data, ba.weight_scale.data = scale[:rows], scale[rows:]
         self._gfx1201_in_proj = (weight, scale, rows)
         # The P1 prefill route pins each validated layer's weight storage; the
         # bytes are unchanged, so expand and check the moved shards again.
-        p1 = quark_w4a4_mxfp4._gfx1201_p1
         if p1 is not None:
             for proj in (qkvz, ba):
                 if p1.is_validated(proj):
@@ -955,6 +973,17 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             )
         )
 
+    def _gfx1201_kq3_in_proj(self, x_q, x_s):
+        """The packed input projection on kq3 records (SGLANG_GFX1201_MXFP4_KQ3)."""
+        from sglang.srt.layers.quantization.quark.schemes import gfx1201_mxfp4_kq3
+
+        records, _, rows = self._gfx1201_in_proj
+        out = torch.empty(
+            (x_q.shape[0], records.n), dtype=torch.bfloat16, device=x_q.device
+        )
+        gfx1201_mxfp4_kq3.gemm_any(records, x_q, x_s, torch.bfloat16, out)
+        return out[:, :rows], out[:, rows:]
+
     def _forward_input_proj(self, hidden_states: torch.Tensor):
         if (
             self._gfx1201_in_proj is not None
@@ -975,6 +1004,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                     "Packed MXFP4 GDN input projection (gfx1201) takes the quantized norm read: %d rows",
                     x_q.shape[0],
                 )
+            if scale is None:
+                return self._gfx1201_kq3_in_proj(x_q, x_s)
             out = torch.empty(
                 (x_q.shape[0], weight.shape[0]), dtype=torch.bfloat16, device=x_q.device
             )
@@ -994,6 +1025,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
             weight, scale, rows = self._gfx1201_in_proj
             x_q, x_s = dynamic_mxfp4_quant(hidden_states)
+            if scale is None:
+                return self._gfx1201_kq3_in_proj(x_q, x_s)
             out = torch.empty(
                 (hidden_states.shape[0], weight.shape[0]),
                 dtype=torch.bfloat16,
