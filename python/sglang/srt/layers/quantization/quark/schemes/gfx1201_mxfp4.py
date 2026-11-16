@@ -25,10 +25,16 @@ from the op234 runtime are available, each off unless its variable is 1:
   A graph-captured, DRAM-fed sweep (2026-11-09) measured 80.0 to 66.8,
   64.4 to 58.1 and 138.0 to 132.7 us per call at M8, with outputs bitwise
   equal to the single partition on random data (not guaranteed in general).
+- SGLANG_GFX1201_SPLITK_FUSED_REDUCE: run those split-K GEMMs as one kernel,
+  the last partition of each tile summing the partials in the same fixed order
+  (gfx1201_mxfp4_splitk), instead of a GEMM plus a reduce kernel. Bitwise equal
+  to the two-kernel path. Each compiled variant's code is checked once
+  (fused_splitk_asm_ok); a variant that fails the check uses the two-kernel path.
 """
 
 import logging
 import os
+import re
 
 import torch
 import triton
@@ -47,6 +53,7 @@ def _enabled(name: str) -> bool:
 GATE_UP_WAVE0 = _enabled("SGLANG_GFX1201_GATE_UP_WAVE0")
 SPLITK_DOWNOUT = _enabled("SGLANG_GFX1201_SPLITK_DOWNOUT")
 SPLITK_WIDE = _enabled("SGLANG_GFX1201_SPLITK_WIDE")
+SPLITK_FUSED_REDUCE = _enabled("SGLANG_GFX1201_SPLITK_FUSED_REDUCE")
 _VERIFY_ROWS = (8, 16)
 _GATE_UP_SHAPE = (17408, 5120)
 # (N, K) -> K partitions; every partition covers whole BLOCK_SIZE_K=128 blocks.
@@ -60,6 +67,12 @@ _SPLITK_SCRATCH_FLOATS = max(parts * max(_VERIFY_ROWS) * n
                              for table in (_SPLITK_DOWNOUT_PARTS, _SPLITK_WIDE_PARTS)
                              for (n, _), parts in table.items())
 _splitk_scratch: dict = {}
+# One int32 arrival counter per output tile for the fused reduce, shared by every
+# launch on the device (each launch leaves its counters at zero). The largest
+# verify grid has cdiv(16, 16) * cdiv(17408, 64) = 272 tiles.
+_SPLITK_COUNTERS = 4096
+_splitk_counters: dict = {}
+_fused_asm_checked: dict = {}
 
 _GEMM_CONFIG = {
     "BLOCK_SIZE_M": 64,
@@ -134,7 +147,55 @@ def _splitk_partials(device: torch.device, m: int, n: int, parts: int):
             return None
         scratch = torch.empty(_SPLITK_SCRATCH_FLOATS, dtype=torch.float32, device=device)
         _splitk_scratch[device.index] = scratch
+        _splitk_counters[device.index] = torch.zeros(_SPLITK_COUNTERS, dtype=torch.int32, device=device)
     return scratch[: parts * m * n].view(parts, m, n)
+
+
+def fused_splitk_asm_ok(asm: str):
+    """Check the compiled fused split-K kernel keeps the ordering it relies on.
+
+    Returns (ok, reason). Required, in the code before the counter atomic: an
+    s_wait_storecnt 0x0 between the last partial store and the workgroup barrier
+    (so every wave's stores are complete before the count is published); the
+    atomic at device scope; and, after it, device- or system-scope partial loads.
+    """
+    lines = [l.strip() for l in asm.splitlines() if l.strip() and not l.strip().startswith((";", "."))]
+    atom = [i for i, l in enumerate(lines) if re.match(r"(global|buffer)_atomic_add_u32", l)]
+    if len(atom) != 1:
+        return False, f"expected one counter atomic, found {len(atom)}"
+    a = atom[0]
+    if "scope:SCOPE_DEV" not in lines[a] and "scope:SCOPE_SYS" not in lines[a]:
+        return False, "counter atomic is not device scope"
+    stores = [i for i in range(a) if re.match(r"(global|buffer)_store", lines[i])]
+    bar = [i for i in range(a) if lines[i].startswith("s_barrier_signal")]
+    if not stores or not bar:
+        return False, "no partial store or barrier before the atomic"
+    last_store = stores[-1]
+    first_bar = next((i for i in bar if i > last_store), None)
+    if first_bar is None:
+        return False, "no barrier after the last partial store"
+    if not any(lines[i].startswith(("s_wait_storecnt 0x0", "s_wait_storecnt_dscnt 0x0")) for i in range(last_store + 1, first_bar)):
+        return False, "partial stores are not drained (s_wait_storecnt 0x0) before the barrier"
+    loads = [l for l in lines[a + 1:] if re.match(r"(global|buffer)_load", l)]
+    if not loads or not all(("scope:SCOPE_DEV" in l or "scope:SCOPE_SYS" in l) for l in loads):
+        return False, "partial reloads are not device scope"
+    return True, ""
+
+
+def _launch_fused(x, w, x_scales, w_scales, partials, y, counters, m, n, packed_k, config, grid):
+    from sglang.srt.layers.quantization.quark.schemes import gfx1201_mxfp4_splitk as _fk
+
+    return _fk._gemm_afp4wfp4_splitk_fused_kernel[grid](
+        x, w, partials, y, counters, x_scales, w_scales,
+        m, n, packed_k,
+        x.stride(0), x.stride(1),
+        w.stride(1), w.stride(0),
+        partials.stride(0), partials.stride(1), partials.stride(2),
+        y.stride(0), y.stride(1),
+        x_scales.stride(0), x_scales.stride(1),
+        w_scales.stride(0), w_scales.stride(1),
+        **config,
+    )
 
 
 def _launch(x, w, x_scales, w_scales, c, m, n, packed_k, config, grid, c_strides):
@@ -190,6 +251,23 @@ def gemm_afp4wfp4(x, w, x_scales, w_scales, dtype, y, *, gate_up_wave0=None, spl
                 logger.info("Split-K MXFP4 verify GEMM (gfx1201) route: %d rows, N=%d K=%d, %d partitions",
                             m, n, k, parts)
             split = dict(config, NUM_KSPLIT=parts, SPLITK_BLOCK_SIZE=k // parts)
+            key = (y.device.index, m, n, k, parts)
+            if SPLITK_FUSED_REDUCE and _fused_asm_checked.get(key, True):
+                if k % (parts * config["BLOCK_SIZE_K"]) or grid[0] > _SPLITK_COUNTERS:
+                    raise ValueError("fused split-K needs whole K blocks per partition and a counter per tile")
+                compiled = _launch_fused(x, w, x_scales, w_scales, partials, y, _splitk_counters[y.device.index],
+                                         m, n, packed_k, split, (grid[0] * parts,))
+                if key not in _fused_asm_checked:
+                    ok, reason = fused_splitk_asm_ok(compiled.asm["amdgcn"])
+                    _fused_asm_checked[key] = ok
+                    if ok:
+                        logger.info("Fused split-K reduce (gfx1201) route: %d rows, N=%d K=%d, %d partitions",
+                                    m, n, k, parts)
+                    else:
+                        # This launch already ran: recompute it on the checked two-kernel path.
+                        logger.error("Fused split-K reduce disabled for %d rows, N=%d K=%d: %s", m, n, k, reason)
+                if _fused_asm_checked[key]:
+                    return y
             _launch(x, w, x_scales, w_scales, partials, m, n, packed_k, split, (grid[0] * parts,),
                     (partials.stride(0), partials.stride(1), partials.stride(2)))
             _splitk_reduce_kernel[(triton.cdiv(m * n, _SPLITK_REDUCE_BLOCK),)](
