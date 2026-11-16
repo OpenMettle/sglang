@@ -307,6 +307,10 @@ def _validate_draft_kv_bundling(cfg) -> None:
         )
     for setting, active in (
         ("--enable-unified-memory", cfg.enable_unified_memory),
+        # gfx1201 port: the HiCache paths of upstream #47057/#47058 were rebased
+        # over the pin's batched write-back eviction but could not be run without
+        # a GPU, so they stay closed until they are qualified.
+        ("--enable-hierarchical-cache", cfg.enable_hierarchical_cache),
         ("--enable-hisparse", cfg.enable_hisparse),
         ("--enable-int8-mamba-checkpoint", cfg.enable_int8_mamba_checkpoint),
         ("PD disaggregation", cfg.disaggregation_mode != "null"),

@@ -2375,6 +2375,7 @@ class TestDraftKVBundlingChecks(CustomTestCase):
             speculative_algorithm="DFLASH",
             device="cuda",
             enable_unified_memory=False,
+            enable_hierarchical_cache=False,
             enable_hisparse=False,
             enable_int8_mamba_checkpoint=False,
             disaggregation_mode="null",
@@ -2386,6 +2387,10 @@ class TestDraftKVBundlingChecks(CustomTestCase):
             (dict(device="cpu"), "CUDA"),
             (dict(disaggregation_mode="decode"), "PD disaggregation"),
             (dict(enable_unified_memory=True), "--enable-unified-memory"),
+            (
+                dict(enable_hierarchical_cache=True),
+                "--enable-hierarchical-cache",
+            ),
             (
                 dict(enable_int8_mamba_checkpoint=True),
                 "--enable-int8-mamba-checkpoint",

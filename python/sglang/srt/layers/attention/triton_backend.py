@@ -264,6 +264,19 @@ class TritonAttnBackend(AttentionBackend):
             and self.page_size == 1
             and not self.runner_ids.is_translating
         )
+        if model_runner.is_draft_worker and get_spec().speculative_draft_kv_bundling:
+            # A bundled draft keeps every layer's KV in the window sub-pool, which
+            # is far smaller than the target's slot space. Its reads and writes
+            # must take that sub-pool's ids; full-space ids would index other
+            # requests' rows, or past the buffer.
+            if not (
+                self.use_sliding_window_kv_pool
+                and self.runner_ids.window_kv_kind == IdSpaceKind.SLIDING_WINDOW
+            ):
+                raise RuntimeError(
+                    "--speculative-draft-kv-bundling: the draft's attention backend "
+                    "has no sliding-window id space for its KV pool."
+                )
         self.dcp_size = attention_dcp_size(
             backend="triton",
             model_config=model_runner.model_config,
@@ -1694,6 +1707,13 @@ class TritonAttnBackend(AttentionBackend):
         ran. The descales are 1.0 except for an fp8 cache under gfx1201_fp8_kv."""
         from sglang.kernels.ops.attention import verify_attention_gfx1151 as va
 
+        # The kernel gathers full-space slot ids from req_to_token, so it cannot
+        # serve a layer whose KV lives in the window sub-pool (a hybrid-SWA
+        # model's window layers, every layer of a bundled DFLASH draft).
+        if self.use_sliding_window_kv_pool and self.kv_layers.plays(
+            layer.layer_id, IdSpaceKind.SLIDING_WINDOW
+        ):
+            return False
         # the token count qo_indptr is built from
         num_tokens_per_req = self._target_verify_num_tokens_per_req(
             forward_batch.spec_info
