@@ -21,6 +21,7 @@ from the op234 runtime are available, each off unless its variable is 1:
   equal to the single partition (op234 S4).
 """
 
+import logging
 import os
 
 import torch
@@ -29,6 +30,9 @@ import triton.language as tl
 
 from sglang.srt.layers.quantization.quark.schemes import gfx1201_mxfp4_kernels as _k
 
+
+logger = logging.getLogger(__name__)
+_splitk_routed = set()
 
 def _enabled(name: str) -> bool:
     return os.environ.get(name, "0").strip().lower() in ("1", "true", "yes")
@@ -158,6 +162,9 @@ def gemm_afp4wfp4(x, w, x_scales, w_scales, dtype, y, *, gate_up_wave0=None, spl
         # BLOCK_SIZE_K=128 blocks, so every partition is EVEN_K.
         partials = _splitk_partials(y.device, m, n)
         if partials is not None:
+            if (m, n, k) not in _splitk_routed:
+                _splitk_routed.add((m, n, k))
+                logger.info("Split-K MXFP4 verify GEMM (gfx1201) route: %d rows, N=%d K=%d", m, n, k)
             split = dict(config, NUM_KSPLIT=_SPLITK_PARTS, SPLITK_BLOCK_SIZE=k // _SPLITK_PARTS)
             _launch(x, w, x_scales, w_scales, partials, m, n, packed_k, split, (grid[0] * _SPLITK_PARTS,),
                     (partials.stride(0), partials.stride(1), partials.stride(2)))

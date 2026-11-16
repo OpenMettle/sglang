@@ -156,6 +156,7 @@ from sglang.srt.utils import (
 )
 
 logger = logging.getLogger(__name__)
+_GFX1201_NORM_QUANT_SKIPS = set()
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_cpu = is_cpu()
@@ -755,7 +756,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         if not gfx1201_gdn_norm_quant.ENABLED:
             return False
         proj, norm = self.out_proj, self.norm
-        return (
+        eligible = (
             quark_w4a4_mxfp4._use_gfx1201_mxfp4
             and type(getattr(proj, "scheme", None)) is quark_w4a4_mxfp4.QuarkW4A4MXFP4
             and proj.bias is None
@@ -776,6 +777,18 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             and x.shape[0] // heads in gfx1201_gdn_norm_quant.TOKENS
             and proj.weight.shape[1] * 2 == heads * x.shape[1]
         )
+        small = x.dim() != 2 or x.shape[0] <= max(gfx1201_gdn_norm_quant.TOKENS) * heads
+        key = (tuple(x.shape), tuple(z.shape), x.dtype, heads)
+        if not eligible and small and key not in _GFX1201_NORM_QUANT_SKIPS:
+            _GFX1201_NORM_QUANT_SKIPS.add(key)
+            logger.info(
+                "Fused GDN norm MXFP4 quant (gfx1201) skipped: x %s %s stride %s, z %s %s stride %s, "
+                "heads %d, norm weight %s %s, out_proj scheme %s weight %s, gfx1201 MXFP4 %s",
+                tuple(x.shape), x.dtype, x.stride(), tuple(z.shape), z.dtype, z.stride(), heads,
+                tuple(norm.weight.shape), norm.weight.dtype, type(getattr(proj, "scheme", None)).__name__,
+                tuple(proj.weight.shape), quark_w4a4_mxfp4._use_gfx1201_mxfp4,
+            )
+        return eligible
 
     def finalize_gfx1201_mxfp4_in_proj(self) -> bool:
         """Pack the loaded MXFP4 QKVZ and BA shards into one weight/scale pair.

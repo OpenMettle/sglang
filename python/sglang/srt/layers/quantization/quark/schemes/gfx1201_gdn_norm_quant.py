@@ -13,6 +13,8 @@ The kernel body is the op234 runtime's copy: the FLA gated layer-norm forward
 replaced by the vendored AITER MXFP4 quantizer (gfx1201_mxfp4_kernels).
 """
 
+import logging
+
 import torch
 import triton
 import triton.language as tl
@@ -28,6 +30,8 @@ ENABLED = (
     and get_bool_env_var("SGLANG_GFX1201_GDN_NORM_QUANT")
 )
 TOKENS = (8, 16)
+logger = logging.getLogger(__name__)
+_routed = set()
 _ROWS_PER_BLOCK = 4
 
 
@@ -178,6 +182,9 @@ def gated_norm_mxfp4(x, z, weight, eps, heads):
     rmsnorm(x) * weight * silu(z) for x, z [T*H, N] BF16, one head per row."""
     m, n = x.shape
     tokens = m // heads
+    if (tokens, heads) not in _routed:
+        _routed.add((tokens, heads))
+        logger.info("Fused GDN norm MXFP4 quant (gfx1201) route: %d tokens, %d heads", tokens, heads)
     packed = torch.empty((tokens, heads * n // 2), dtype=torch.uint8, device=x.device)
     scales = torch.empty_strided(
         (tokens, heads * n // 32), (1, tokens), dtype=torch.uint8, device=x.device
