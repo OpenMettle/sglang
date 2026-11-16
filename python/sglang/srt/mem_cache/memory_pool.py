@@ -71,6 +71,7 @@ from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     UnquantizedKVCacheMethod,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.mem_cache import elastic_kv_tail
 from sglang.srt.mem_cache.allocation_sizing import get_mamba_tracking_slots
 from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
 from sglang.srt.mem_cache.index_key_cache import IndexKeyCache
@@ -2243,6 +2244,7 @@ class MHATokenToKVPool(KVCache, MHAKVView):
         )
         self.post_capture_active = post_capture_active
         self._post_capture_owner = None
+        self._elastic_tail_owner = None
         self.head_num = swa_head_num if swa_head_num is not None else head_num
         self.head_dim = swa_head_dim if swa_head_dim is not None else head_dim
         self.v_head_dim = (
@@ -2459,6 +2461,11 @@ class MHATokenToKVPool(KVCache, MHAKVView):
             self.dq_v_buffer = None
             if self.post_capture_active:
                 self._alloc_post_capture_buffers()
+            elif elastic_kv_tail.claims_pool(self):
+                # SGLANG_GFX1201_ELASTIC_KV_BASE_TOKENS: only the base is backed.
+                self._elastic_tail_owner = elastic_kv_tail.allocate_pool_buffers(
+                    self
+                )
             else:
                 self._create_buffers_normal()
         self._kv_buffer_descs = self._build_kv_buffer_descs()
