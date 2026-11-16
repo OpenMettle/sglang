@@ -1664,6 +1664,10 @@ class Envs:
     # the split-K route serves; their weights are stored as kq3 records only and
     # rebuilt into a per-card scratch for every other GEMM.
     SGLANG_GFX1201_MXFP4_KQ3 = EnvBool(False)
+    # gfx1201: the P1 prefill route expands a kq3 layer's FP8 weight directly
+    # from its records instead of first rebuilding the canonical weight
+    # (needs SGLANG_GFX1201_P1_PREFILL and SGLANG_GFX1201_MXFP4_KQ3).
+    SGLANG_GFX1201_P1_FROM_KQ3 = EnvBool(False)
     SGLANG_PCIE_IPC_MAX_NUMEL = EnvInt(0)
 
     # ===================================================================

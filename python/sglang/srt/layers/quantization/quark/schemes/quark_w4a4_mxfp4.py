@@ -190,6 +190,23 @@ if _use_gfx1201_mxfp4 and envs.SGLANG_GFX1201_MXFP4_KQ3.get():
         gfx1201_mxfp4_kq3 as _gfx1201_kq3,
     )
 
+# gfx1201 P1 from kq3 (opt-in): the P1 route expands a kq3 layer from its records.
+_gfx1201_p1_from_kq3 = (
+    _gfx1201_p1 is not None
+    and _gfx1201_kq3 is not None
+    and envs.SGLANG_GFX1201_P1_FROM_KQ3.get()
+)
+
+
+def _gfx1201_p1_validate_kq3(kq3, n, k):
+    """Load time: validate a kq3 layer for P1 as the canonical pair rebuilt from its
+    records; with SGLANG_GFX1201_P1_FROM_KQ3 the expansion read from the records
+    must then equal that validated expansion bit for bit."""
+    _gfx1201_p1.validate_layer(kq3.canonical(), n, k)
+    if _gfx1201_p1_from_kq3:
+        _gfx1201_p1.validate_records(kq3, n, k)
+
+
 if _use_gfx1201_mxfp4:
     from sglang.srt.layers.quantization.quark.schemes.gfx1201_mxfp4 import (
         dynamic_mxfp4_quant,
@@ -471,10 +488,10 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
             n, k = layer.weight.shape[0], layer.weight.shape[1] * 2
             if _gfx1201_p1.admits_shape(n, k):
                 # Expand once, require zero guard flags, compile before traffic.
-                # A kq3 layer is validated as the canonical pair rebuilt from its records.
-                _gfx1201_p1.validate_layer(
-                    layer if kq3 is None else kq3.canonical(), n, k
-                )
+                if kq3 is None:
+                    _gfx1201_p1.validate_layer(layer, n, k)
+                else:
+                    _gfx1201_p1_validate_kq3(kq3, n, k)
         if not _use_aiter_asm_fp4_gemm or not is_gfx95_supported():
             return
 
@@ -982,6 +999,7 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
             x = x.view(-1, x.shape[-1])
             output_shape = [*x.shape[:-1], layer.weight.shape[0]]
 
+        p1_records = None
         if _gfx1201_kq3 is not None and "_gfx1201_kq3" in layer.__dict__:
             kq3 = layer._gfx1201_kq3
             if (
@@ -999,8 +1017,12 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
                     if bias is not None:
                         y = y + bias
                     return y.view(*output_shape) if three_d else y
-            # Every other route reads the canonical weight, rebuilt from the records.
-            layer = kq3.canonical()
+            # Every other route reads the canonical weight, rebuilt from the records;
+            # P1 may expand from the records, so that rebuild waits for its decision.
+            if _gfx1201_p1_from_kq3 and _gfx1201_p1.has_records(kq3):
+                p1_records, layer = kq3, kq3.canon
+            else:
+                layer = kq3.canonical()
 
         if (
             _gfx1201_p1 is not None
@@ -1014,8 +1036,12 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
             and _gfx1201_p1.is_validated(layer)
             and not torch.cuda.is_current_stream_capturing()
         ):
-            y = _gfx1201_p1.apply(layer, x, layer.weight.shape[0], x.shape[1])
+            y = _gfx1201_p1.apply(
+                layer, x, layer.weight.shape[0], x.shape[1], records=p1_records
+            )
             return y.view(*output_shape) if three_d else y
+        if p1_records is not None:
+            p1_records.canonical()
 
         # use_fused_quant_gemm = true, x_q is a bf16/fp16 num
         # x_s is not None = true, x_q is uint8 num

@@ -874,8 +874,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             if p1 is not None:
                 for proj in (qkvz, ba):
                     if p1.validated.pop(id(proj), None) is not None:
-                        p1.validate_layer(
-                            proj._gfx1201_kq3.canonical(),
+                        quark_w4a4_mxfp4._gfx1201_p1_validate_kq3(
+                            proj._gfx1201_kq3,
                             proj.weight.shape[0],
                             proj.weight.shape[1] * 2,
                         )
