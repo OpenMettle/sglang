@@ -184,6 +184,33 @@ def can_fuse_shared_expert(
     return True
 
 
+_gfx1201_silu_mxfp4_logged = False
+
+
+def _gfx1201_silu_mul_mxfp4_ready(mlp: nn.Module, gate_up) -> bool:
+    """gfx1201: SiLU(gate) * up and the down projection's MXFP4 quantization in one
+    kernel (bitwise equal to act_and_mul then the quantizer) on verify-sized rows."""
+    if not envs.SGLANG_GFX1201_SILU_MUL_MXFP4.get():
+        return False
+    if (
+        isinstance(gate_up, tuple)
+        or gate_up.dim() != 2
+        or gate_up.dtype != torch.bfloat16
+        or gate_up.shape[0] not in (8, 16)
+        or not isinstance(mlp.act_fn, SiluAndMul)
+        or hasattr(mlp.down_proj, "base_layer")
+        or getattr(mlp.down_proj, "bias", None) is not None
+    ):
+        return False
+    from sglang.srt.layers.quantization.quark.schemes import quark_w4a4_mxfp4
+
+    return (
+        quark_w4a4_mxfp4._use_gfx1201_mxfp4
+        and type(getattr(mlp.down_proj, "scheme", None)) is quark_w4a4_mxfp4.QuarkW4A4MXFP4
+        and not getattr(mlp.down_proj, "dequantized_bf16", False)
+    )
+
+
 class Qwen2MoeMLP(nn.Module):
     def __init__(
         self,
@@ -236,6 +263,19 @@ class Qwen2MoeMLP(nn.Module):
         gate_up, _ = self.gate_up_proj(x)
         if can_run_silu_fp4_quant_fusion(self, gate_up):
             x, _ = self.down_proj(silu_and_mul_fp4_quant(self, gate_up))
+            return x
+        if _gfx1201_silu_mul_mxfp4_ready(self, gate_up):
+            from sglang.srt.layers.quantization.quark.schemes.gfx1201_silu_mul_mxfp4 import (
+                silu_mul_mxfp4,
+            )
+
+            global _gfx1201_silu_mxfp4_logged
+            if not _gfx1201_silu_mxfp4_logged:
+                _gfx1201_silu_mxfp4_logged = True
+                logger.info(
+                    "gfx1201 SiLU*mul+MXFP4 for down_proj engaged: %d rows", gate_up.shape[0]
+                )
+            x, _ = self.down_proj(silu_mul_mxfp4(gate_up))
             return x
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)

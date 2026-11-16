@@ -1651,6 +1651,9 @@ class Envs:
     # gfx1201: residual add + Gemma RMSNorm + MXFP4 quantization in one kernel
     # for the MXFP4 projections that read the norm on verify-sized batches.
     SGLANG_GFX1201_ADD_NORM_MXFP4 = EnvBool(False)
+    # gfx1201: SiLU(gate) * up + MXFP4 quantization in one kernel for an MXFP4
+    # down projection on verify-sized batches.
+    SGLANG_GFX1201_SILU_MUL_MXFP4 = EnvBool(False)
     SGLANG_PCIE_IPC_MAX_NUMEL = EnvInt(0)
 
     # ===================================================================
