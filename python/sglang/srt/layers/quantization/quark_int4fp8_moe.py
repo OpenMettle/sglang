@@ -1,6 +1,7 @@
 import logging
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
+import importlib.util
 import torch
 from tqdm import tqdm
 from tqdm.std import EMA
@@ -27,8 +28,16 @@ if TYPE_CHECKING:
 _is_hip = is_hip()
 
 
-if _is_hip:
+if _is_hip and importlib.util.find_spec("aiter") is not None:
     from aiter.ops.shuffle import shuffle_weight
+elif _is_hip:
+
+    def shuffle_weight(*args, **kwargs):
+        raise NotImplementedError("INT4-FP8 MoE on ROCm needs AITER's shuffle_weight")
+
+
+# ON_GFX950 below stays defined on every HIP host, with or without AITER.
+if _is_hip:
 
     ON_GFX950 = "gfx950" in torch.cuda.get_device_properties("cuda").gcnArchName
 

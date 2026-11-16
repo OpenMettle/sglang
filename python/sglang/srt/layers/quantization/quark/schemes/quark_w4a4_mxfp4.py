@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import importlib.util
 import logging
 import threading
 from typing import Any, Callable, Optional
@@ -161,7 +162,33 @@ def _dequant_mxfp4_to_bf16(
     return w.to(torch.bfloat16)
 
 
-if _is_hip:
+def _is_gfx1201() -> bool:
+    try:
+        return torch.cuda.get_device_properties(0).gcnArchName.split(":")[0] == "gfx1201"
+    except Exception:
+        return False
+
+
+# gfx1201 (RDNA4) has no AITER build. Its dense MXFP4 path uses the vendored
+# AITER Triton quantizer and FP4 GEMM in gfx1201_mxfp4; the AITER-only routes
+# (ASM GEMM, pre-quantized and fused split-cat inputs) are unavailable there.
+_use_gfx1201_mxfp4 = _is_hip and importlib.util.find_spec("aiter") is None and _is_gfx1201()
+
+if _use_gfx1201_mxfp4:
+    from sglang.srt.layers.quantization.quark.schemes.gfx1201_mxfp4 import (
+        dynamic_mxfp4_quant,
+        gemm_afp4wfp4,
+    )
+
+    def _requires_aiter(*args, **kwargs):
+        raise NotImplementedError(
+            "This MXFP4 route needs AITER; gfx1201 without AITER supports only "
+            "dense MXFP4 linears with plain BF16 activations."
+        )
+
+    gemm_afp4wfp4_pre_quant = per_1x32_f4_quant = gemm_a4w4 = _requires_aiter
+    fused_gemm_afp4wfp4_split_cat = shuffle_weight = _requires_aiter
+elif _is_hip:
     from aiter import gemm_a4w4 as _gemm_a4w4_orig
     from aiter import per_1x32_f4_quant_hip as _per_1x32_f4_quant_hip_orig
     from aiter.ops.shuffle import shuffle_weight
