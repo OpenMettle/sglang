@@ -221,6 +221,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return None
 
     def swa_capacity_and_available(self, *, full_capacity, swa_capacity):
+        if self.page_size == 1:
+            # An elastic tail that is not open is not capacity (0 without one).
+            full_capacity -= self.full_attn_allocator.unavailable_size()
         return (
             (full_capacity, self.full_available_size()),
             (swa_capacity, self.swa_available_size()),
