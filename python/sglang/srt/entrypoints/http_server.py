@@ -158,6 +158,7 @@ from sglang.srt.managers.io_struct import (
     PauseGenerationReqInput,
     PdRoleSwitchReqInput,
     PluginWeightUpdateReqInput,
+    KvTailReqInput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
@@ -1600,6 +1601,68 @@ async def release_memory_occupation(
         await _global_state.tokenizer_manager.release_memory_occupation(obj, request)
     except Exception as e:
         return _create_error_response(e)
+
+
+@app.api_route("/kv_tail", methods=["GET", "POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def kv_tail(request: Request):
+    """Elastic KV tail (SGLANG_GFX1201_ELASTIC_KV_BASE_TOKENS).
+
+    GET, or POST {"action": "status"}, reports the state. POST {"action":
+    "grow"} backs the tail and POST {"action": "shrink"} releases it without
+    waiting for running requests; both answer only when every TP rank has
+    finished, with "ok" false when it did not happen. 200 when ok, 400 for a
+    bad request, 409 otherwise.
+    """
+    try:
+        body = {}
+        if request.method == "POST" and await request.body():
+            body = await request.json()
+        if not isinstance(body, dict):
+            raise ValueError("the request body must be a JSON object")
+        action = body.pop("action", "status")
+        if action == "status":
+            if body:
+                raise ValueError(f"status takes no fields, got {sorted(body)}")
+            ret = await _global_state.tokenizer_manager.kv_tail_status()
+        else:
+            if action not in ("grow", "shrink"):
+                raise ValueError(f"unknown action {action!r}")
+            numbers = {
+                "tail_tokens": int,
+                "keep_free_mib": int,
+                "release_timeout_s": (int, float),
+            }
+            for name, value in body.items():
+                if name not in numbers:
+                    raise ValueError(f"unknown field {name!r}")
+                if isinstance(value, bool) or not isinstance(value, numbers[name]):
+                    raise ValueError(f"{name} must be a number, got {value!r}")
+                if value < 0:
+                    raise ValueError(f"{name} must not be negative")
+            ret = await _global_state.tokenizer_manager.kv_tail(
+                KvTailReqInput(action=action, **body)
+            )
+    except ValueError as e:
+        return ORJSONResponse(
+            {
+                "ok": False,
+                "state": "unknown",
+                "message": str(e),
+                "reason": "bad_request",
+            },
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
+    except Exception as e:
+        return _create_error_response(e)
+    content = {**ret.info, "ok": ret.ok, "state": ret.state, "message": ret.message}
+    if ret.ok:
+        status_code = HTTPStatus.OK
+    elif content.get("reason") == "bad_request":
+        status_code = HTTPStatus.BAD_REQUEST
+    else:
+        status_code = HTTPStatus.CONFLICT
+    return ORJSONResponse(content, status_code=status_code)
 
 
 @app.api_route("/resume_memory_occupation", methods=["GET", "POST"])

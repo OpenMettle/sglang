@@ -64,6 +64,10 @@ from sglang.srt.managers.io_struct import (
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
+    KvTailReqInput,
+    KvTailReqOutput,
+    KvTailStatusReqInput,
+    KvTailStatusReqOutput,
     ReleaseMemoryOccupationReqInput,
     ReleaseMemoryOccupationReqOutput,
     ReleaseUocrDocReqInput,
@@ -90,6 +94,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightVersionReqOutput,
 )
 from sglang.srt.managers.load_snapshot import LoadSnapshot
+from sglang.srt.mem_cache import elastic_kv_tail
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_disagg,
@@ -128,6 +133,8 @@ _COMMUNICATOR_SPECS = [
     ("get_weights_by_name", GetWeightsByNameReqOutput),
     ("release_memory_occupation", ReleaseMemoryOccupationReqOutput),
     ("resume_memory_occupation", ResumeMemoryOccupationReqOutput),
+    ("kv_tail", KvTailReqOutput),
+    ("kv_tail_status", KvTailStatusReqOutput),
     ("check_weights", CheckWeightsReqOutput),
     ("slow_down", SlowDownReqOutput),
     ("pd_role_switch", PdRoleSwitchReqOutput),
@@ -201,6 +208,13 @@ class TokenizerControlMixin:
             setattr(self, f"{name}_communicator", comm)
             dispatch_pairs.append((resp_type, comm.handle_recv))
         self._result_dispatcher += TypeBasedDispatcher(dispatch_pairs)
+        # An elastic KV tail is cache room only: requests stay within the
+        # base context, backed tail or not.
+        kv_tail_config = elastic_kv_tail.config()
+        if kv_tail_config is not None:
+            context_len = min(kv_tail_config.base_context, self.context_len)
+            self.context_len = context_len
+            self.model_config.context_len = context_len
 
     def update_control_communicator_fan_out(self: TokenizerManager, worker_count: int):
         primary_group_control = (
@@ -909,6 +923,21 @@ class TokenizerControlMixin:
         success, message = FanOutCommunicator.merge_results(results)
         if not success:
             raise RuntimeError(message)
+
+    async def kv_tail(self: TokenizerManager, obj: KvTailReqInput) -> KvTailReqOutput:
+        self.auto_create_handle_loop()
+        tic = time.monotonic()
+        result = (await self.kv_tail_communicator(obj))[0]
+        # The scheduler never waits for a request; what is left of the wall
+        # time is the queue behind an earlier resize and the IPC.
+        queued_s = time.monotonic() - tic - result.info.get("elapsed_s", 0.0)
+        result.info["queued_s"] = round(max(0.0, queued_s), 3)
+        result.info["waited"] = queued_s > 0.25
+        return result
+
+    async def kv_tail_status(self: TokenizerManager) -> KvTailStatusReqOutput:
+        self.auto_create_handle_loop()
+        return (await self.kv_tail_status_communicator(KvTailStatusReqInput()))[0]
 
     async def resume_memory_occupation(
         self: TokenizerManager,

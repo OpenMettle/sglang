@@ -189,6 +189,10 @@ from sglang.srt.managers.io_struct import (
     PauseGenerationReqInput,
     PdRoleSwitchReqInput,
     PluginWeightUpdateReqInput,
+    KvTailReqInput,
+    KvTailReqOutput,
+    KvTailStatusReqInput,
+    KvTailStatusReqOutput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
     ReleaseUocrDocReqInput,
@@ -340,7 +344,7 @@ from sglang.srt.managers.utils import (
     make_abort_req,
     validate_input_length,
 )
-from sglang.srt.mem_cache import kv_cache_builder
+from sglang.srt.mem_cache import elastic_kv_tail, kv_cache_builder
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.common import checkpoint_kv_cache, storage_prefetch_end
 from sglang.srt.mem_cache.events import KvEventLoraNames
@@ -765,6 +769,9 @@ class Scheduler(
         self.check_truncation_align_fits_chunk()
 
         self.init_weight_updater()
+
+        # SGLANG_GFX1201_ELASTIC_KV_BASE_TOKENS; None when it is not set
+        self.kv_tail = elastic_kv_tail.install(self)
 
         # Init request dispatcher
         self.init_request_dispatcher()
@@ -1992,6 +1999,18 @@ class Scheduler(
                     self.weight_updater.resume_memory_occupation,
                 ),
                 (
+                    KvTailReqInput,
+                    lambda req: elastic_kv_tail.dispatch(
+                        self.kv_tail, req, KvTailReqOutput
+                    ),
+                ),
+                (
+                    KvTailStatusReqInput,
+                    lambda req: elastic_kv_tail.dispatch(
+                        self.kv_tail, req, KvTailStatusReqOutput
+                    ),
+                ),
+                (
                     CheckWeightsReqInput,
                     self.weight_updater.check_weights,
                 ),
@@ -2344,6 +2363,8 @@ class Scheduler(
                     self.send_control_output(output, recv_req)
 
         self.flush_wrapper.check_pending()
+        if self.kv_tail is not None:
+            self.kv_tail.check_pending()
         if self.external_corpus_manager is not None:
             self.external_corpus_manager.check_pending_load()
 

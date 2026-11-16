@@ -2262,6 +2262,38 @@ class ReleaseMemoryOccupationReqOutput(BaseReq, kw_only=True):
     message: str
 
 
+class KvTailReqInput(BaseReq, kw_only=True):
+    """Resize the elastic KV tail (mem_cache/elastic_kv_tail.py)."""
+
+    action: Literal["grow", "shrink"]
+    # grow: tail tokens to back; None backs the whole reserved tail.
+    tail_tokens: Optional[int] = None
+    # grow: refuse unless this much device memory stays free afterwards.
+    keep_free_mib: int = 1536
+    # shrink: how long to wait for the device to show the memory free.
+    release_timeout_s: float = 10.0
+
+
+class KvTailReqOutput(BaseReq, kw_only=True):
+    ok: bool
+    state: str
+    message: str = ""
+    info: Dict[str, Any] = {}
+
+
+class KvTailStatusReqInput(BaseReq, kw_only=True):
+    """Read the elastic KV tail's state; answered while a shrink waits."""
+
+    action: Literal["status"] = "status"
+
+
+class KvTailStatusReqOutput(BaseReq, kw_only=True):
+    ok: bool
+    state: str
+    message: str = ""
+    info: Dict[str, Any] = {}
+
+
 class ResumeMemoryOccupationReqInput(BaseReq, kw_only=True):
     # Optional tags to identify the memory region, which is primarily used for RL
     # Currently we only support `weights` and `kv_cache`
