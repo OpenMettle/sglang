@@ -16,6 +16,7 @@ Memory-efficient attention for prefill.
 It supports page size = 1 and prefill with KV cache (i.e. extend).
 """
 
+import logging
 import math
 from typing import Optional
 
@@ -28,6 +29,8 @@ from sglang.kernels.ops.attention.decode_attention import _extract_kv_strides
 from sglang.kernels.ops.attention.score_mod import unpack_aux_tensors
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_gfx95_supported, is_gfx1250_supported, is_hip
+
+logger = logging.getLogger(__name__)
 
 _is_hip = is_hip()
 _is_gfx95 = _is_hip and is_gfx95_supported()
@@ -50,6 +53,16 @@ try:
 except (AttributeError, ValueError):
     _triton_version_parts = (0, 0)
 _is_triton_ge_37 = _triton_version_parts >= (3, 7)
+
+
+_EXTEND_TILE32_LOGGED = set()
+
+
+def _log_extend_tile32_once(device):
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    if index not in _EXTEND_TILE32_LOGGED:
+        _EXTEND_TILE32_LOGGED.add(index)
+        logger.info("Extend attention (gfx1201) route: head dim 256, tile 32 x 32, 4 warps")
 
 
 def _get_block_sizes_for_extend_attention(Lq: int, Lv: int):
@@ -1024,6 +1037,18 @@ def extend_attention_fwd(
     BLOCK_DMODEL, BLOCK_DPE, BLOCK_DV, BLOCK_M, BLOCK_N, num_warps = (
         _get_block_sizes_for_extend_attention(Lq, Lv)
     )
+    if (
+        _is_hip
+        and envs.SGLANG_GFX1201_EXTEND_TILE32.get()
+        and (Lq, Lv, BLOCK_M, BLOCK_N, num_warps) == (256, 256, 64, 64, 4)
+        and not kimi_k3_shape
+        and _is_gfx1201_device(q_extend.device)
+    ):
+        # gfx1201, head dim 256: a 32 x 32 tile with 4 warps measured -11% with no
+        # prefix and -14..-15% at 8K-88K prefixes per 2048-token chunk against
+        # 64 x 64 with C4's 8 warps (16 layers, DRAM-fed). Not bitwise.
+        BLOCK_M, BLOCK_N = 32, 32
+        _log_extend_tile32_once(q_extend.device)
 
     USE_CUSTOM_MASK = custom_mask is not None
     # Skip custom mask for prefix part
